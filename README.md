@@ -162,6 +162,11 @@ full-screen 0:00→24:00 plot showing the **average ± standard deviation** per 
 plot to cycle the bin size **1 h → 30 min → 15 min**; it **auto-returns to the live view after
 10 s** of no touch. On boot the firmware reloads the day's CSV so charts survive a power cycle.
 
+**Night dimming** — the backlight drops to its **lowest step between 22:00 and 07:00** and runs at 100 % the
+rest of the day, so the monitor stays readable in a dark room without lighting it up. Change the
+window or the levels with `NIGHT_START_MIN` / `NIGHT_END_MIN` / `BRIGHT_NIGHT` at the top of
+`cyd_vitals.ino`. Until the clock is set the display stays at full brightness.
+
 **CSV logs** — one file per day on the SD card, e.g. `/vitals_2026-08-07.csv`:
 
 ```csv

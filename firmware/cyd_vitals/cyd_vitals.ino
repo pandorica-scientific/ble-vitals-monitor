@@ -5,7 +5,8 @@
 //   yellow/red warning lines. Tap a column -> 24h avg±std chart (tap cycles 1h/30m/15m;
 //   auto-returns to live after 10 s of no touch).
 // Also: WiFi+NTP clock (Europe/Warsaw) synced once at boot then reboots BLE-only (coexistence),
-//   and per-reading CSV logging to microSD (one file per day).
+//   per-reading CSV logging to microSD (one file per day), and a backlight that drops to its
+//   lowest step between 22:00 and 07:00 (100% otherwise) so it doesn't light up the room at night.
 //
 // Panel: TPM408 = ILI9342 320x240. Touch: XPT2046 bit-banged (own pins, no SD SPI clash).
 // Decode: HR = byte10, SpO2 = byte13, SKIN C = big-endian uint16(bytes 6-7)/10.
@@ -30,6 +31,11 @@
 #define SKIN_MIN 28.0f
 #define SKIN_MAX 42.0f
 #define STALE_MS 30000
+// backlight: dim overnight so the display doesn't light up the room
+#define NIGHT_START_MIN (22*60)   // 22:00 -> dim
+#define NIGHT_END_MIN   (7*60)    // 07:00 -> full
+#define BRIGHT_DAY   255          // 100%
+#define BRIGHT_NIGHT 1            // lowest non-zero PWM step (0 would switch the backlight off)
 #define SD_SCK 18
 #define SD_MISO 19
 #define SD_MOSI 23
@@ -156,6 +162,14 @@ void loadCsvToday(){
 }
 bool nowHM(char* o){ struct tm tm; if(!getLocalTime(&tm))return false; strftime(o,8,"%H:%M",&tm); return true; }
 int minuteOfDay(){ struct tm tm; if(!getLocalTime(&tm))return -1; return tm.tm_hour*60+tm.tm_min; }
+// Backlight BRIGHT_NIGHT from 22:00 to 07:00, 100% otherwise. Only writes the PWM on a change.
+// Gated on g_timeReady: with no clock getLocalTime() blocks, and full brightness is the safe default.
+void applyBrightness(){
+  static int cur=-1; int want=BRIGHT_DAY;
+  if(g_timeReady){ int m=minuteOfDay();
+    if(m>=0 && (m>=NIGHT_START_MIN || m<NIGHT_END_MIN)) want=BRIGHT_NIGHT; }
+  if(want!=cur){ tft.setBrightness(want); cur=want; }
+}
 
 // ---------- UI ----------
 const uint16_t GREY=0x9CD3, DIM=0x52AA, LINE=0x2965;
@@ -293,7 +307,7 @@ void setup(){
   pinMode(T_MISO,INPUT); pinMode(T_IRQ,INPUT); digitalWrite(T_CS,HIGH); digitalWrite(T_CLK,LOW);
   tft.init();
   for(int r=0;r<4;r++){ tft.setRotation(r); tft.fillScreen(TFT_BLACK); }
-  tft.setRotation(ROTATION); tft.setBrightness(200);
+  tft.setRotation(ROTATION); tft.setBrightness(BRIGHT_DAY);   // full until the clock is known
   W=tft.width(); H=tft.height(); HDR=28; COLW=W/2; RH=(H-HDR)/2;
   setenv("TZ","CET-1CEST,M3.5.0,M10.5.0/3",1); tzset();   // re-apply TZ each boot (survives via env, not the reboot)
   bootMsg("SD card..."); initSD();
@@ -307,6 +321,7 @@ void setup(){
     if (getLocalTime(&tmc) && tmc.tm_year>120) { bootMsg("clock set - rebooting for BLE..."); delay(250); ESP.restart(); }
   }
   g_timeReady = getLocalTime(&tmc) && tmc.tm_year>120;
+  applyBrightness();
   bootMsg("Loading history..."); loadCsvToday();
   bootMsg("Bluetooth...");
   BLEDevice::init(""); BLEScan* scan=BLEDevice::getScan();
@@ -332,6 +347,10 @@ void loop(){
   // auto-return to the live view after 10 s of no touch in the plot
   if(view==PLOT && millis()-lastTouch>10000){ view=LIVE; g_lastSig="~"; tft.fillScreen(TFT_BLACK); }
   if(view==LIVE) renderLive();
+
+  // day/night backlight, checked every 10 s (no-op unless the level actually changes)
+  static uint32_t lastBl=0;
+  if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); }
 
   // log + bin new readings
   static int lastLogged=-1;
