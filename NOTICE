@@ -1,0 +1,53 @@
+Baby Sensor Relax — unofficial passive monitor & logger
+Copyright 2026 Robert Kiewisz
+
+Licensed under the PolyForm Noncommercial License 1.0.0 — see LICENSE.
+
+The notes below are context, not part of the licence text.
+
+
+WHAT "NONCOMMERCIAL" MEANS HERE
+-------------------------------
+
+Building, flashing, modifying, and sharing this for your own family is a
+permitted purpose. So is use by hospitals, universities, charities, and
+public research or health organisations — the licence covers those
+explicitly, regardless of how they are funded.
+
+What is not permitted is commercial use: selling this software or devices
+running it, bundling it into a paid product or service, or using it to
+provide a service for a fee. If you want to do any of that, ask me.
+
+Paid childcare in a private home (a nanny, a childminder) is, in my
+reading, personal and family use rather than commercial exploitation of
+the software, and is permitted.
+
+
+NOT A MEDICAL DEVICE
+--------------------
+
+This project is not a medical device and is not intended for the
+diagnosis, monitoring, treatment, or prevention of any medical
+condition. It is a hobby and educational project. Do not rely on it to
+keep a baby safe.
+
+
+TRADEMARKS
+----------
+
+"Baby Sensor Relax" and any related names are trademarks of their
+respective owner, used here only descriptively (nominative fair use) to
+state what this project is compatible with. This project is independent
+and is not affiliated with, sponsored by, or endorsed by the
+manufacturer, and contains none of their firmware, code, images, or
+branding.
+
+
+THIRD-PARTY COMPONENTS
+----------------------
+
+The firmware is built against libraries that are not covered by this
+project's licence and remain under their own terms, including LovyanGFX
+(FreeBSD/BSD-style) and the Espressif ESP32 Arduino core and its
+Bluetooth and WiFi stacks (LGPL-2.1 and Apache-2.0). No source from
+those projects is redistributed here.

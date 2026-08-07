@@ -1,0 +1,20 @@
+# Secrets — never commit WiFi credentials
+wifi.txt
+**/wifi.txt
+
+# Captured data / logs
+*.csv
+*.log
+
+# Build artifacts
+build/
+*.bin
+*.elf
+*.hex
+# compiled Mac tools (from `swiftc -o`)
+mac/passive_scan
+mac/babysensor_reader
+*.dSYM/
+
+# OS cruft
+.DS_Store
