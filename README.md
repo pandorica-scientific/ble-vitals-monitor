@@ -167,6 +167,14 @@ rest of the day, so the monitor stays readable in a dark room without lighting i
 window or the levels with `NIGHT_START_MIN` / `NIGHT_END_MIN` / `BRIGHT_NIGHT` at the top of
 `cyd_vitals.ino`. Until the clock is set the display stays at full brightness.
 
+> **Powering it from a USB power bank?** At the lowest backlight steps the whole board can draw
+> less than the ~50–100 mA most power banks treat as "nothing is plugged in", so the bank switches
+> itself off after an hour or so. The firmware counters this with a short current burst every
+> `KEEPALIVE_EVERY_MS` while dimmed (CPU spin + read-only SD traffic — silent, and no wear on the
+> card). If your bank still cuts out, either raise `BRIGHT_NIGHT`, set `KEEPALIVE_BRIGHT` to add a
+> visible backlight flash to the burst, or just use a mains USB charger — chargers have no
+> low-load cutoff, which is the only fix that costs nothing.
+
 **CSV logs** — one file per day on the SD card, e.g. `/vitals_2026-08-07.csv`:
 
 ```csv

@@ -6,7 +6,8 @@
 //   auto-returns to live after 10 s of no touch).
 // Also: WiFi+NTP clock (Europe/Warsaw) synced once at boot then reboots BLE-only (coexistence),
 //   per-reading CSV logging to microSD (one file per day), and a backlight that drops to its
-//   lowest step between 22:00 and 07:00 (100% otherwise) so it doesn't light up the room at night.
+//   lowest step between 22:00 and 07:00 (100% otherwise) so it doesn't light up the room at night,
+//   with a periodic current burst so a USB power bank doesn't cut out on the tiny night load.
 //
 // Panel: TPM408 = ILI9342 320x240. Touch: XPT2046 bit-banged (own pins, no SD SPI clash).
 // Decode: HR = byte10, SpO2 = byte13, SKIN C = big-endian uint16(bytes 6-7)/10.
@@ -36,6 +37,14 @@
 #define NIGHT_END_MIN   (7*60)    // 07:00 -> full
 #define BRIGHT_DAY   255          // 100%
 #define BRIGHT_NIGHT 1            // lowest non-zero PWM step (0 would switch the backlight off)
+// Power-bank keep-alive. Most USB power banks cut power when the draw stays under ~50-100 mA:
+// at BRIGHT_NIGHT=1 the backlight draws almost nothing, the board falls under that threshold and
+// the bank switches off (~1 h observed). These bursts spike the current often enough to reset the
+// bank's idle timer. Only run while dimmed. A mains USB charger has no such cutoff and needs none.
+#define KEEPALIVE_EVERY_MS 8000   // burst interval; must beat the bank's idle timer (usually 10-30 s). 0 = off
+#define KEEPALIVE_MS       120    // burst length
+#define KEEPALIVE_BRIGHT   0      // >0 also flashes the backlight this bright during the burst
+                                  // (a real, VISIBLE flash - last resort if the silent burst is too weak)
 #define SD_SCK 18
 #define SD_MISO 19
 #define SD_MOSI 23
@@ -162,17 +171,46 @@ void loadCsvToday(){
 }
 bool nowHM(char* o){ struct tm tm; if(!getLocalTime(&tm))return false; strftime(o,8,"%H:%M",&tm); return true; }
 int minuteOfDay(){ struct tm tm; if(!getLocalTime(&tm))return -1; return tm.tm_hour*60+tm.tm_min; }
-// Backlight BRIGHT_NIGHT from 22:00 to 07:00, 100% otherwise. Only writes the PWM on a change.
-// Gated on g_timeReady: with no clock getLocalTime() blocks, and full brightness is the safe default.
-void applyBrightness(){
-  static int cur=-1; int want=BRIGHT_DAY;
-  if(g_timeReady){ int m=minuteOfDay();
-    if(m>=0 && (m>=NIGHT_START_MIN || m<NIGHT_END_MIN)) want=BRIGHT_NIGHT; }
-  if(want!=cur){ tft.setBrightness(want); cur=want; }
+// 22:00 -> 07:00 is "night": dim backlight + dark theme.
+// Gated on g_timeReady: with no clock getLocalTime() blocks, and the day look is the safe default.
+bool isNight(){
+  if(!g_timeReady) return false;
+  int m=minuteOfDay();
+  return m>=0 && (m>=NIGHT_START_MIN || m<NIGHT_END_MIN);
+}
+int wantBrightness(){ return isNight()?BRIGHT_NIGHT:BRIGHT_DAY; }
+void setBacklight(int want){                     // single owner of the PWM; only writes on a change
+  static int cur=-1; if(want!=cur){ tft.setBrightness(want); cur=want; }
+}
+void applyBrightness(){ setBacklight(wantBrightness()); }
+// Burst of current so a power bank doesn't decide nothing is plugged in (see KEEPALIVE_* above).
+// Silent by default: spin the CPU out of idle and hammer the SD card. The SD traffic is
+// READ-only, so it costs no flash wear on the card holding the logs.
+void keepAlive(){
+  if(!KEEPALIVE_EVERY_MS) return;
+  static uint32_t last=0; if(millis()-last < KEEPALIVE_EVERY_MS) return;
+  if(!isNight()) return;                         // only needed while dimmed
+  last=millis();
+  if(KEEPALIVE_BRIGHT) setBacklight(KEEPALIVE_BRIGHT);
+  File f; if(g_sdReady && g_timeReady){ char fn[32]; csvName(fn); f=SD.open(fn); }
+  uint8_t buf[512]; volatile float spin=1.0f; uint32_t t0=millis();
+  while(millis()-t0 < KEEPALIVE_MS){
+    if(f){ if(!f.available()) f.seek(0); f.read(buf,sizeof(buf)); }
+    for(int i=0;i<2000;i++) spin=spin*1.000001f+0.5f;
+  }
+  if(f) f.close();
+  if(KEEPALIVE_BRIGHT) applyBrightness();        // back to the scheduled level
 }
 
 // ---------- UI ----------
-const uint16_t GREY=0x9CD3, DIM=0x52AA, LINE=0x2965;
+// This panel drives its pixels inverted: the code writes TFT_BLACK and the screen shows white.
+// The daytime look below is therefore "white background, dark text" as seen on the device, and it
+// is left exactly as it was. At night every background/chrome colour is replaced by its 16-bit
+// complement, which flips the panel to a black background with light text. The VALUE colours
+// (heart, oxygen, skin, alerts) are deliberately NOT flipped so the numbers keep their usual hues.
+#define INV(c) ((uint16_t)~(uint16_t)(c))
+const uint16_t GREY_D=0x9CD3, DIM_D=0x52AA, LINE_D=0x2965, GRID_D=0x1082, BG_D=TFT_BLACK;
+uint16_t GREY=GREY_D, DIM=DIM_D, LINE=LINE_D, GRID=GRID_D, BG=BG_D;
 int W,H,HDR,COLW,RH;
 enum View { LIVE, PLOT };
 View view=LIVE; int plotMetric=0; int plotBinMin=60;   // 60/30/15
@@ -187,7 +225,7 @@ void cell(int col,int r,const char* label,const String& val,const char* unit,uin
   tft.setTextDatum(textdatum_t::top_left); tft.drawString(val,x+8,y+20);
 }
 void drawHeader(bool stale,int sig,int rssi,long ageS){
-  tft.fillRect(0,2,W,HDR-4,TFT_BLACK);
+  tft.fillRect(0,2,W,HDR-4,BG);
   tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextDatum(textdatum_t::top_left);
   tft.setTextColor(GREY); tft.drawString("Oliwia",6,4);
   if(g_skinValid && !stale){ char sb[10]; snprintf(sb,10,"%.1fC",g_skin);   // skin temp small, by the name
@@ -220,7 +258,7 @@ void miniPlot(int x,int y,int w,int h,bool isHR){
   }
 }
 void drawLive(bool stale,int hr,int spo2,float skin,bool tempOK,int sig,int rssi,long ageS,const String& alert){
-  bool d=stale; tft.fillScreen(TFT_BLACK); tft.drawFastHLine(0,HDR-2,W,LINE);
+  bool d=stale; tft.fillScreen(BG); tft.drawFastHLine(0,HDR-2,W,LINE);
   drawHeader(stale,sig,rssi,ageS);
   // top row: big current values
   cell(0,0,"HEART", (d||!hr)?"--":String(hr),   "bpm", d?DIM:((hr<HR_LOW||hr>HR_HIGH)?TFT_RED:0x6E6C));
@@ -251,7 +289,7 @@ void drawPlot(){
   float ymin = metric?70:40, ymax = metric?100:200;
   uint16_t col = metric?0x74FF:0x6E6C;
   int PX0=34, PY0=30, PX1=W-6, PY1=H-24;
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(BG);
   // title (no Back button — auto-returns to the live view after 10 s of no touch)
   tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(GREY); tft.setTextDatum(textdatum_t::top_center);
   tft.drawString(String(metric?"OXYGEN":"HEART")+" 24h ("+plotBinMin+"m)", W/2, 5);
@@ -260,10 +298,10 @@ void drawPlot(){
   // Y gridlines + labels
   tft.setFont(&fonts::Font0); tft.setTextColor(DIM);
   for(int k=0;k<=4;k++){ float v=ymin+(ymax-ymin)*k/4; int y=PY1-(int)((v-ymin)/(ymax-ymin)*(PY1-PY0));
-    tft.drawFastHLine(PX0,y,PX1-PX0,0x1082); tft.setTextDatum(textdatum_t::middle_right); tft.drawString(String((int)v),PX0-2,y); }
+    tft.drawFastHLine(PX0,y,PX1-PX0,GRID); tft.setTextDatum(textdatum_t::middle_right); tft.drawString(String((int)v),PX0-2,y); }
   // X gridlines + hour labels (0,6,12,18,24)
   for(int hh=0;hh<=24;hh+=6){ int x=PX0+(int)((float)hh/24*(PX1-PX0));
-    tft.drawFastVLine(x,PY0,PY1-PY0,0x1082); tft.setTextDatum(textdatum_t::top_center); tft.drawString(String(hh),x,PY1+2); }
+    tft.drawFastVLine(x,PY0,PY1-PY0,GRID); tft.setTextDatum(textdatum_t::top_center); tft.drawString(String(hh),x,PY1+2); }
   // bars: avg +/- std as error bars
   float bw=(float)(PX1-PX0)/nb;
   for(int i=0;i<nb;i++){
@@ -282,6 +320,18 @@ void drawPlot(){
   tft.setFont(&fonts::Font0); tft.drawString("tap: change bin  -  auto-back 10s",W-4,H-2);
 }
 
+// Swap the chrome palette when the night window opens or closes, then repaint.
+// Value colours are untouched on purpose - the numbers keep the same hues day and night.
+void applyTheme(){
+  static int cur=-1; int n=isNight()?1:0;
+  if(n==cur) return; cur=n;
+  BG=n?INV(BG_D):BG_D;      GREY=n?INV(GREY_D):GREY_D;  DIM=n?INV(DIM_D):DIM_D;
+  LINE=n?INV(LINE_D):LINE_D; GRID=n?INV(GRID_D):GRID_D;
+  g_lastSig="~";                                 // invalidate the live-view redraw cache
+  tft.fillScreen(BG);
+  if(view==PLOT) drawPlot();
+}
+
 // ---------- touch ----------
 uint16_t xpt(uint8_t cmd){
   digitalWrite(T_CS,LOW);
@@ -298,7 +348,7 @@ bool touchXY(int& sx,int& sy){
   return true;
 }
 
-void bootMsg(const char* s){ tft.fillScreen(TFT_BLACK); tft.setFont(&fonts::FreeSans9pt7b);
+void bootMsg(const char* s){ tft.fillScreen(BG); tft.setFont(&fonts::FreeSans9pt7b);
   tft.setTextColor(GREY); tft.setTextDatum(textdatum_t::middle_center); tft.drawString(s,tft.width()/2,tft.height()/2); }
 
 void setup(){
@@ -306,7 +356,7 @@ void setup(){
   pinMode(T_CLK,OUTPUT); pinMode(T_MOSI,OUTPUT); pinMode(T_CS,OUTPUT);
   pinMode(T_MISO,INPUT); pinMode(T_IRQ,INPUT); digitalWrite(T_CS,HIGH); digitalWrite(T_CLK,LOW);
   tft.init();
-  for(int r=0;r<4;r++){ tft.setRotation(r); tft.fillScreen(TFT_BLACK); }
+  for(int r=0;r<4;r++){ tft.setRotation(r); tft.fillScreen(BG); }
   tft.setRotation(ROTATION); tft.setBrightness(BRIGHT_DAY);   // full until the clock is known
   W=tft.width(); H=tft.height(); HDR=28; COLW=W/2; RH=(H-HDR)/2;
   setenv("TZ","CET-1CEST,M3.5.0,M10.5.0/3",1); tzset();   // re-apply TZ each boot (survives via env, not the reboot)
@@ -321,13 +371,13 @@ void setup(){
     if (getLocalTime(&tmc) && tmc.tm_year>120) { bootMsg("clock set - rebooting for BLE..."); delay(250); ESP.restart(); }
   }
   g_timeReady = getLocalTime(&tmc) && tmc.tm_year>120;
-  applyBrightness();
+  applyBrightness(); applyTheme();
   bootMsg("Loading history..."); loadCsvToday();
   bootMsg("Bluetooth...");
   BLEDevice::init(""); BLEScan* scan=BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(new CB(),true);
   scan->setActiveScan(true); scan->setInterval(100); scan->setWindow(99); scan->start(0,nullptr,false);
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(BG);
   Serial.printf("[ready] sd=%d time=%d\n",g_sdReady,g_timeReady);
 }
 
@@ -345,12 +395,13 @@ void loop(){
     }
   }
   // auto-return to the live view after 10 s of no touch in the plot
-  if(view==PLOT && millis()-lastTouch>10000){ view=LIVE; g_lastSig="~"; tft.fillScreen(TFT_BLACK); }
+  if(view==PLOT && millis()-lastTouch>10000){ view=LIVE; g_lastSig="~"; tft.fillScreen(BG); }
   if(view==LIVE) renderLive();
 
   // day/night backlight, checked every 10 s (no-op unless the level actually changes)
   static uint32_t lastBl=0;
-  if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); }
+  if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); applyTheme(); }
+  keepAlive();                                   // stop a power bank cutting out on the tiny night load
 
   // log + bin new readings
   static int lastLogged=-1;
