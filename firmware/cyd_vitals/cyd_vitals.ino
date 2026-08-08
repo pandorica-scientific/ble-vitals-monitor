@@ -35,6 +35,8 @@
 // backlight: dim overnight so the display doesn't light up the room
 #define NIGHT_START_MIN (22*60)   // 22:00 -> dim
 #define NIGHT_END_MIN   (7*60)    // 07:00 -> full
+#define FORCE_NIGHT 0             // test aid: set to 1 to force night mode regardless of the clock,
+                                  // so the dark theme can be checked without waiting for 22:00
 #define BRIGHT_DAY   255          // 100%
 #define BRIGHT_NIGHT 1            // lowest non-zero PWM step (0 would switch the backlight off)
 // Power-bank keep-alive. Most USB power banks cut power when the draw stays under ~50-100 mA:
@@ -174,6 +176,7 @@ int minuteOfDay(){ struct tm tm; if(!getLocalTime(&tm))return -1; return tm.tm_h
 // 22:00 -> 07:00 is "night": dim backlight + dark theme.
 // Gated on g_timeReady: with no clock getLocalTime() blocks, and the day look is the safe default.
 bool isNight(){
+  if(FORCE_NIGHT) return true;
   if(!g_timeReady) return false;
   int m=minuteOfDay();
   return m>=0 && (m>=NIGHT_START_MIN || m<NIGHT_END_MIN);

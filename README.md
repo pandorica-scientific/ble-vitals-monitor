@@ -162,10 +162,13 @@ full-screen 0:00→24:00 plot showing the **average ± standard deviation** per 
 plot to cycle the bin size **1 h → 30 min → 15 min**; it **auto-returns to the live view after
 10 s** of no touch. On boot the firmware reloads the day's CSV so charts survive a power cycle.
 
-**Night dimming** — the backlight drops to its **lowest step between 22:00 and 07:00** and runs at 100 % the
-rest of the day, so the monitor stays readable in a dark room without lighting it up. Change the
-window or the levels with `NIGHT_START_MIN` / `NIGHT_END_MIN` / `BRIGHT_NIGHT` at the top of
-`cyd_vitals.ino`. Until the clock is set the display stays at full brightness.
+**Night mode** — **between 22:00 and 07:00** the backlight drops to its lowest step and the display
+switches to a **dark theme**: background and the grey chrome (labels, name, clock, separators, chart
+grid) flip to their inverse, while the HEART / OXYGEN / temperature colours stay exactly as they are
+during the day. The rest of the day it runs at 100 % with the normal theme. Change the window,
+the brightness levels or the palette with `NIGHT_START_MIN` / `NIGHT_END_MIN` / `BRIGHT_NIGHT` and
+the `*_D` colour constants at the top of `cyd_vitals.ino`; set `FORCE_NIGHT 1` to check the dark
+theme without waiting until 22:00. Until the clock is set the display stays in the daytime look.
 
 > **Powering it from a USB power bank?** At the lowest backlight steps the whole board can draw
 > less than the ~50–100 mA most power banks treat as "nothing is plugged in", so the bank switches
