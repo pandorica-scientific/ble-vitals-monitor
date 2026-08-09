@@ -6,8 +6,9 @@
 //   auto-returns to live after 10 s of no touch).
 // Also: WiFi+NTP clock (Europe/Warsaw) synced once at boot then reboots BLE-only (coexistence),
 //   per-reading CSV logging to microSD (one file per day), and a backlight that drops to its
-//   lowest step between 22:00 and 07:00 (100% otherwise) so it doesn't light up the room at night,
-//   with a periodic current burst so a USB power bank doesn't cut out on the tiny night load.
+//   lowest step between 20:00 and 08:00 so it doesn't light up the room at night.
+// Power: the BLE scan is duty-cycled and the daytime backlight runs below full, because the
+//   whole board lives off a USB power bank (see SCAN_* and BRIGHT_DAY below).
 //
 // Panel: TPM408 = ILI9342 320x240. Touch: XPT2046 bit-banged (own pins, no SD SPI clash).
 // Decode: HR = byte10, SpO2 = byte13, SKIN C = big-endian uint16(bytes 6-7)/10.
@@ -33,20 +34,21 @@
 #define SKIN_MAX 42.0f
 #define STALE_MS 30000
 // backlight: dim overnight so the display doesn't light up the room
-#define NIGHT_START_MIN (22*60)   // 22:00 -> dim
-#define NIGHT_END_MIN   (7*60)    // 07:00 -> full
+#define NIGHT_START_MIN (20*60)   // 20:00 -> dim
+#define NIGHT_END_MIN   (8*60)    // 08:00 -> full
 #define FORCE_NIGHT 0             // test aid: set to 1 to force night mode regardless of the clock,
-                                  // so the dark theme can be checked without waiting for 22:00
-#define BRIGHT_DAY   255          // 100%
+                                  // so the dark theme can be checked without waiting for 20:00
+#define BRIGHT_DAY   140          // ~55%. Still easily readable indoors; the backlight is the second
+                                  // biggest consumer after the radio and its current tracks the PWM
+                                  // duty closely, so this is roughly half the power of 255.
 #define BRIGHT_NIGHT 1            // lowest non-zero PWM step (0 would switch the backlight off)
-// Power-bank keep-alive. Most USB power banks cut power when the draw stays under ~50-100 mA:
-// at BRIGHT_NIGHT=1 the backlight draws almost nothing, the board falls under that threshold and
-// the bank switches off (~1 h observed). These bursts spike the current often enough to reset the
-// bank's idle timer. Only run while dimmed. A mains USB charger has no such cutoff and needs none.
-#define KEEPALIVE_EVERY_MS 8000   // burst interval; must beat the bank's idle timer (usually 10-30 s). 0 = off
-#define KEEPALIVE_MS       120    // burst length
-#define KEEPALIVE_BRIGHT   0      // >0 also flashes the backlight this bright during the burst
-                                  // (a real, VISIBLE flash - last resort if the silent burst is too weak)
+// BLE scan duty cycle. Receiving costs ~90-100 mA, so scanning 99% of the time (the old 99/100)
+// dominated the power budget for no benefit: the wristband advertises every ~1.5 s and only
+// produces a new heart rate every ~20 s (docs/PROTOCOL.md). At 30% duty the odds of missing every
+// advert for a full STALE_MS window are ~0.7^20, well under 0.1%, so the "stale" flag behaves as
+// before. Lower this further to save more, at the cost of a slower first reading after a dropout.
+#define SCAN_INTERVAL_MS 1000     // how often a scan window starts
+#define SCAN_WINDOW_MS   300      // how long the radio listens inside that window
 #define SD_SCK 18
 #define SD_MISO 19
 #define SD_MOSI 23
@@ -173,7 +175,7 @@ void loadCsvToday(){
 }
 bool nowHM(char* o){ struct tm tm; if(!getLocalTime(&tm))return false; strftime(o,8,"%H:%M",&tm); return true; }
 int minuteOfDay(){ struct tm tm; if(!getLocalTime(&tm))return -1; return tm.tm_hour*60+tm.tm_min; }
-// 22:00 -> 07:00 is "night": dim backlight + dark theme.
+// 20:00 -> 08:00 is "night": dim backlight + dark theme.
 // Gated on g_timeReady: with no clock getLocalTime() blocks, and the day look is the safe default.
 bool isNight(){
   if(FORCE_NIGHT) return true;
@@ -186,24 +188,6 @@ void setBacklight(int want){                     // single owner of the PWM; onl
   static int cur=-1; if(want!=cur){ tft.setBrightness(want); cur=want; }
 }
 void applyBrightness(){ setBacklight(wantBrightness()); }
-// Burst of current so a power bank doesn't decide nothing is plugged in (see KEEPALIVE_* above).
-// Silent by default: spin the CPU out of idle and hammer the SD card. The SD traffic is
-// READ-only, so it costs no flash wear on the card holding the logs.
-void keepAlive(){
-  if(!KEEPALIVE_EVERY_MS) return;
-  static uint32_t last=0; if(millis()-last < KEEPALIVE_EVERY_MS) return;
-  if(!isNight()) return;                         // only needed while dimmed
-  last=millis();
-  if(KEEPALIVE_BRIGHT) setBacklight(KEEPALIVE_BRIGHT);
-  File f; if(g_sdReady && g_timeReady){ char fn[32]; csvName(fn); f=SD.open(fn); }
-  uint8_t buf[512]; volatile float spin=1.0f; uint32_t t0=millis();
-  while(millis()-t0 < KEEPALIVE_MS){
-    if(f){ if(!f.available()) f.seek(0); f.read(buf,sizeof(buf)); }
-    for(int i=0;i<2000;i++) spin=spin*1.000001f+0.5f;
-  }
-  if(f) f.close();
-  if(KEEPALIVE_BRIGHT) applyBrightness();        // back to the scheduled level
-}
 
 // ---------- UI ----------
 // This panel drives its pixels inverted: the code writes TFT_BLACK and the screen shows white.
@@ -360,7 +344,7 @@ void setup(){
   pinMode(T_MISO,INPUT); pinMode(T_IRQ,INPUT); digitalWrite(T_CS,HIGH); digitalWrite(T_CLK,LOW);
   tft.init();
   for(int r=0;r<4;r++){ tft.setRotation(r); tft.fillScreen(BG); }
-  tft.setRotation(ROTATION); tft.setBrightness(BRIGHT_DAY);   // full until the clock is known
+  tft.setRotation(ROTATION); tft.setBrightness(BRIGHT_DAY);   // daytime level until the clock is known
   W=tft.width(); H=tft.height(); HDR=28; COLW=W/2; RH=(H-HDR)/2;
   setenv("TZ","CET-1CEST,M3.5.0,M10.5.0/3",1); tzset();   // re-apply TZ each boot (survives via env, not the reboot)
   bootMsg("SD card..."); initSD();
@@ -379,7 +363,11 @@ void setup(){
   bootMsg("Bluetooth...");
   BLEDevice::init(""); BLEScan* scan=BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(new CB(),true);
-  scan->setActiveScan(true); scan->setInterval(100); scan->setWindow(99); scan->start(0,nullptr,false);
+  // Passive: never transmit a scan request. Required by the receive-only rule at the top of this
+  // file, and it also saves the TX bursts. Everything we decode is in the advertisement itself.
+  scan->setActiveScan(false);
+  scan->setInterval(SCAN_INTERVAL_MS); scan->setWindow(SCAN_WINDOW_MS);
+  scan->start(0,nullptr,false);
   tft.fillScreen(BG);
   Serial.printf("[ready] sd=%d time=%d\n",g_sdReady,g_timeReady);
 }
@@ -404,7 +392,6 @@ void loop(){
   // day/night backlight, checked every 10 s (no-op unless the level actually changes)
   static uint32_t lastBl=0;
   if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); applyTheme(); }
-  keepAlive();                                   // stop a power bank cutting out on the tiny night load
 
   // log + bin new readings
   static int lastLogged=-1;

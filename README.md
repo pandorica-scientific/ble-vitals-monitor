@@ -162,21 +162,31 @@ full-screen 0:00→24:00 plot showing the **average ± standard deviation** per 
 plot to cycle the bin size **1 h → 30 min → 15 min**; it **auto-returns to the live view after
 10 s** of no touch. On boot the firmware reloads the day's CSV so charts survive a power cycle.
 
-**Night mode** — **between 22:00 and 07:00** the backlight drops to its lowest step and the display
+**Night mode** — **between 20:00 and 08:00** the backlight drops to its lowest step and the display
 switches to a **dark theme**: background and the grey chrome (labels, name, clock, separators, chart
 grid) flip to their inverse, while the HEART / OXYGEN / temperature colours stay exactly as they are
-during the day. The rest of the day it runs at 100 % with the normal theme. Change the window,
-the brightness levels or the palette with `NIGHT_START_MIN` / `NIGHT_END_MIN` / `BRIGHT_NIGHT` and
-the `*_D` colour constants at the top of `cyd_vitals.ino`; set `FORCE_NIGHT 1` to check the dark
-theme without waiting until 22:00. Until the clock is set the display stays in the daytime look.
+during the day. Change the window, the brightness levels or the palette with `NIGHT_START_MIN` /
+`NIGHT_END_MIN` / `BRIGHT_NIGHT` and the `*_D` colour constants at the top of `cyd_vitals.ino`; set
+`FORCE_NIGHT 1` to check the dark theme without waiting until 20:00. Until the clock is set the
+display stays in the daytime look.
 
-> **Powering it from a USB power bank?** At the lowest backlight steps the whole board can draw
-> less than the ~50–100 mA most power banks treat as "nothing is plugged in", so the bank switches
-> itself off after an hour or so. The firmware counters this with a short current burst every
-> `KEEPALIVE_EVERY_MS` while dimmed (CPU spin + read-only SD traffic — silent, and no wear on the
-> card). If your bank still cuts out, either raise `BRIGHT_NIGHT`, set `KEEPALIVE_BRIGHT` to add a
-> visible backlight flash to the burst, or just use a mains USB charger — chargers have no
-> low-load cutoff, which is the only fix that costs nothing.
+### Power draw
+
+The board runs off 5 V USB and the on-board AMS1117 is a **linear** regulator, so roughly a third of
+the input energy becomes heat before anything useful happens. That sets the floor; the two knobs
+above it are the radio and the backlight.
+
+| Setting | Why it is where it is |
+|---|---|
+| `SCAN_INTERVAL_MS 1000` / `SCAN_WINDOW_MS 300` | Receiving costs ~90–100 mA. The wristband advertises every ~1.5 s and only produces a new heart rate every ~20 s, so listening 30 % of the time loses nothing. Lower the window to save more. |
+| `BRIGHT_DAY 140` | Backlight current tracks the PWM duty closely, so this is about half the power of full brightness and still easily readable indoors. |
+| `BRIGHT_NIGHT 1` | Lowest non-zero step. `0` switches the backlight off entirely. |
+
+> **Powering it from a USB power bank?** Expect **roughly 2 days from a 10 000 mAh bank** — that
+> rating is at the 3.7 V cell, so after the boost to 5 V you actually get ~6 000–6 500 mAh. Two more
+> things to know. Some banks cut power when the draw stays under ~50–100 mA, which the dimmed night
+> load can trigger; if yours switches itself off overnight, raise `BRIGHT_NIGHT` a few steps. And a
+> mains USB charger has no low-load cutoff and no runtime limit, so it sidesteps both problems.
 
 **CSV logs** — one file per day on the SD card, e.g. `/vitals_2026-08-07.csv`:
 
