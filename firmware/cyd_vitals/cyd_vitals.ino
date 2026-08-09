@@ -1,4 +1,4 @@
-// esp32_cyd_vitals.ino — Baby Sensor Relax monitor + logger (CYD ESP32-2432S028).
+// cyd_vitals.ino — Baby Sensor Relax monitor + logger (CYD ESP32-2432S028).
 // RECEIVE-ONLY passive BLE. Never connects/writes/pairs -> base link untouched.
 //
 // Display: big HR + SpO2, skin temp small by the name, 1-hour BPM/SpO2 sparklines with
@@ -9,6 +9,9 @@
 //   lowest step between 20:00 and 08:00 so it doesn't light up the room at night.
 // Power: the BLE scan is duty-cycled and the daytime backlight runs below full, because the
 //   whole board lives off a USB power bank (see SCAN_* and BRIGHT_DAY below).
+// Export: swipe UP on the live view and the board becomes its own WiFi access point serving the
+//   logged CSVs to a phone, so a week or a month can be pulled anywhere without removing the SD
+//   card. Swipe DOWN (or wait out the timeout) to resume. Monitoring is PAUSED while it is up.
 //
 // Panel: TPM408 = ILI9342 320x240. Touch: XPT2046 bit-banged (own pins, no SD SPI clash).
 // Decode: HR = byte10, SpO2 = byte13, SKIN C = big-endian uint16(bytes 6-7)/10.
@@ -23,8 +26,10 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <WebServer.h>
 #include <time.h>
 #include <math.h>
+#include "app_html.h"      // the report page served in export mode (PROGMEM)
 
 #define ROTATION 0
 #define HR_LOW 90
@@ -38,17 +43,31 @@
 #define NIGHT_END_MIN   (8*60)    // 08:00 -> full
 #define FORCE_NIGHT 0             // test aid: set to 1 to force night mode regardless of the clock,
                                   // so the dark theme can be checked without waiting for 20:00
-#define BRIGHT_DAY   140          // ~55%. Still easily readable indoors; the backlight is the second
-                                  // biggest consumer after the radio and its current tracks the PWM
-                                  // duty closely, so this is roughly half the power of 255.
+#define BRIGHT_DAY   140          // ~55%: backlight current tracks PWM duty closely, so this is
+                                  // about half the power of 255 and still easily readable indoors
 #define BRIGHT_NIGHT 1            // lowest non-zero PWM step (0 would switch the backlight off)
-// BLE scan duty cycle. Receiving costs ~90-100 mA, so scanning 99% of the time (the old 99/100)
-// dominated the power budget for no benefit: the wristband advertises every ~1.5 s and only
-// produces a new heart rate every ~20 s (docs/PROTOCOL.md). At 30% duty the odds of missing every
-// advert for a full STALE_MS window are ~0.7^20, well under 0.1%, so the "stale" flag behaves as
-// before. Lower this further to save more, at the cost of a slower first reading after a dropout.
+// BLE scan duty cycle. Receiving costs ~90-100 mA, so the old 99%-duty scan (99/100) dominated the
+// power budget for nothing: the wristband advertises every ~1.5 s and only produces a new heart
+// rate every ~20 s (docs/PROTOCOL.md).
+// MEASURED on this board with the display and SD logging running - reception falls off much faster
+// than the duty ratio suggests, because rendering and SD writes compete with the radio:
+//   300/1000 (30%) -> worst gap 13.0 s, ~15 adverts/30 s  - too close to STALE_MS, drops to "--"
+//   500/1000 (50%) -> worst gap  2.0 s, ~29 adverts/30 s  - what we ship
+// Re-measure the worst gap against STALE_MS before lowering the window.
 #define SCAN_INTERVAL_MS 1000     // how often a scan window starts
-#define SCAN_WINDOW_MS   300      // how long the radio listens inside that window
+#define SCAN_WINDOW_MS   500      // how long the radio listens inside that window
+// ---- data export mode: swipe UP from the live view, swipe DOWN to resume ----
+// The board becomes its own WiFi access point and serves the logged CSVs to a phone, so the data
+// can be pulled anywhere (a doctor's office) with no home network, no hotspot and no SD removal.
+// BLE cannot run while WiFi does (see the coexistence note in setup()), so this mode PAUSES
+// monitoring - hence the loud on-screen warning and the automatic return below.
+#define AP_SSID    "BabyVitals"
+#define AP_PASS    "babyvitals"   // WPA2 needs >=8 chars. Shown on screen, so nothing to memorise.
+#define EXPORT_TIMEOUT_MS 600000  // resume monitoring by itself after 10 min, in case of a stray swipe
+// Gesture thresholds. The swipe must cross more than half the 240 px height and be clearly more
+// vertical than horizontal, so brushing the screen while moving the board cannot stop monitoring.
+#define SWIPE_MIN_DY  130         // px of vertical travel before it counts as a swipe
+#define TAP_MAX_MOVE  20          // px; anything that moves further than this is not a tap
 #define SD_SCK 18
 #define SD_MISO 19
 #define SD_MOSI 23
@@ -59,11 +78,12 @@
 #define T_MISO 39
 #define T_CS 33
 #define T_IRQ 36
-// touch calibration (from 5-point cal)
-#define TX0 170
-#define TX1 3840
-#define TY0 320
-#define TY1 3760
+// touch calibration (from 5-point cal). TOUCH_ prefix on purpose: bare TX1/RX1 etc. are already
+// UART pin macros in the ESP32 core, and redefining them here shadowed the core's values.
+#define TOUCH_X0 170
+#define TOUCH_X1 3840
+#define TOUCH_Y0 320
+#define TOUCH_Y1 3760
 
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ILI9342 _panel; lgfx::Bus_SPI _bus; lgfx::Light_PWM _light;
@@ -145,10 +165,13 @@ void syncTimeOverWifi() {
   // Fully release the radio to BLE (WIFI_OFF alone can leave coexistence throttling BLE)
   WiFi.disconnect(true,true); WiFi.mode(WIFI_OFF); esp_wifi_stop(); esp_wifi_deinit();
 }
-void csvName(char* out){ struct tm tm; getLocalTime(&tm); strftime(out,32,"/vitals_%Y-%m-%d.csv",&tm); }
+// One definition of the log filename: the writer (logRow) and the reader (loadCsvToday) must never
+// disagree about which file "today" is.
+void csvName(char* out,const struct tm* tm){ strftime(out,32,"/vitals_%Y-%m-%d.csv",tm); }
+void csvName(char* out){ struct tm tm; getLocalTime(&tm); csvName(out,&tm); }
 void logRow(int hr,int spo2,float skin,bool sv){
   if(!g_sdReady||!g_timeReady) return; struct tm tm; if(!getLocalTime(&tm)) return;
-  char fn[32]; strftime(fn,32,"/vitals_%Y-%m-%d.csv",&tm); bool isNew=!SD.exists(fn);
+  char fn[32]; csvName(fn,&tm); bool isNew=!SD.exists(fn);
   File f=SD.open(fn,FILE_APPEND); if(!f) return;
   if(isNew) f.println("timestamp,hr_bpm,spo2_pct,skin_c");
   char ts[24]; strftime(ts,24,"%F %T",&tm);
@@ -199,8 +222,9 @@ void applyBrightness(){ setBacklight(wantBrightness()); }
 const uint16_t GREY_D=0x9CD3, DIM_D=0x52AA, LINE_D=0x2965, GRID_D=0x1082, BG_D=TFT_BLACK;
 uint16_t GREY=GREY_D, DIM=DIM_D, LINE=LINE_D, GRID=GRID_D, BG=BG_D;
 int W,H,HDR,COLW,RH;
-enum View { LIVE, PLOT };
+enum View { LIVE, PLOT, EXPORT };
 View view=LIVE; int plotMetric=0; int plotBinMin=60;   // 60/30/15
+uint32_t g_exportStart=0;                              // millis() when export mode began
 String g_lastSig="~"; long g_lastAge=-999;             // live-view redraw state (global so we can force it)
 
 void cell(int col,int r,const char* label,const String& val,const char* unit,uint16_t color){
@@ -330,9 +354,126 @@ uint16_t xpt(uint8_t cmd){
 bool touchXY(int& sx,int& sy){
   uint16_t z=xpt(0xB0); if(z<250) return false;
   uint32_t ax=0,ay=0; for(int i=0;i<5;i++){ ax+=xpt(0x90); ay+=xpt(0xD0);} ax/=5; ay/=5;
-  sx=constrain((int)map(ax,TX0,TX1,0,W),0,W-1);
-  sy=constrain((int)map(ay,TY0,TY1,0,H),0,H-1);
+  sx=constrain((int)map(ax,TOUCH_X0,TOUCH_X1,0,W),0,W-1);
+  sy=constrain((int)map(ay,TOUCH_Y0,TOUCH_Y1,0,H),0,H-1);
   return true;
+}
+
+// ---------- data export: SoftAP + a tiny read-only HTTP server ----------
+WebServer* g_http=nullptr;
+
+// Whitelist, never a path mapping: /wifi.txt on the same card holds the HOME network password in
+// plain text, and this access point is reachable by anyone in the room while it is up.
+static bool exportAllowed(const String& p){
+  return p.startsWith("/vitals_") && p.endsWith(".csv") && p.indexOf("..")<0;
+}
+// Index of available days, so the page can offer a range without guessing filenames.
+static void handleDays(){
+  String j="["; File dir=SD.open("/");
+  if(dir){
+    for(File e=dir.openNextFile(); e; e=dir.openNextFile()){
+      String n=e.name(); if(!n.startsWith("/")) n="/"+n;
+      if(exportAllowed(n)){
+        if(j.length()>1) j+=",";
+        j+="{\"f\":\""+n+"\",\"n\":"+String((uint32_t)e.size())+"}";
+      }
+      e.close();
+    }
+    dir.close();
+  }
+  j+="]"; g_http->send(200,"application/json",j);
+}
+static void handleFile(){
+  String p=g_http->uri();
+  if(!exportAllowed(p)){ g_http->send(404,"text/plain","not found"); return; }
+  File f=SD.open(p);
+  if(!f){ g_http->send(404,"text/plain","not found"); return; }
+  g_http->streamFile(f,"text/csv"); f.close();
+}
+
+void drawExportStatic(){
+  tft.fillScreen(BG);
+  tft.setTextDatum(textdatum_t::top_center);
+  tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(GREY);
+  tft.drawString("DATA EXPORT",W/2,5);
+  tft.drawFastHLine(0,24,W,LINE);
+  struct Row { const char* label; const char* value; } rows[] = {
+    {"Wi-Fi network", AP_SSID},
+    {"Password",      AP_PASS},
+    {"Open in browser","http://192.168.4.1"},
+  };
+  int y=34;
+  for(auto& r : rows){
+    tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(DIM);
+    tft.setTextDatum(textdatum_t::top_center); tft.drawString(r.label,W/2,y);
+    tft.setFont(&fonts::FreeSansBold12pt7b); tft.setTextColor(GREY);
+    tft.drawString(r.value,W/2,y+15);
+    y+=52;
+  }
+  // Monitoring really is off while this is up - say so in the same style as a vitals alert.
+  int by=H-42; tft.fillRect(0,by,W,20,TFT_RED);
+  tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE);
+  tft.setTextDatum(textdatum_t::middle_center);
+  tft.drawString("MONITORING PAUSED",W/2,by+10);
+  tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(DIM);
+  tft.setTextDatum(textdatum_t::top_center);
+  tft.drawString("swipe down to resume",W/2,by+24);
+}
+// Only the countdown changes, so redraw just that strip once a second.
+void drawExportCountdown(){
+  uint32_t left = (millis()-g_exportStart >= EXPORT_TIMEOUT_MS) ? 0
+                : (EXPORT_TIMEOUT_MS-(millis()-g_exportStart))/1000;
+  char b[56]; snprintf(b,56,"auto-resume in %lu:%02lu  (%d client%s)",
+                       (unsigned long)left/60,(unsigned long)left%60,
+                       WiFi.softAPgetStationNum(), WiFi.softAPgetStationNum()==1?"":"s");
+  tft.fillRect(0,H-16,W,16,BG);
+  tft.setFont(&fonts::Font0); tft.setTextColor(DIM);
+  tft.setTextDatum(textdatum_t::top_center); tft.drawString(b,W/2,H-13);
+}
+
+void enterExport(){
+  view=EXPORT; g_exportStart=millis();
+  BLEDevice::deinit(true);                       // hand the radio over before WiFi starts
+  WiFi.mode(WIFI_AP);
+  if(!WiFi.softAP(AP_SSID,AP_PASS)){             // no AP means no export: get back to monitoring
+    Serial.println("[export] softAP failed"); delay(200); ESP.restart();
+  }
+  g_http=new WebServer(80);
+  g_http->on("/",[](){ g_http->send_P(200,"text/html",APP_HTML); });
+  g_http->on("/days",handleDays);
+  g_http->onNotFound(handleFile);
+  g_http->begin();
+  setBacklight(BRIGHT_DAY);                      // the credentials have to be readable at night too
+  drawExportStatic(); drawExportCountdown();
+  Serial.printf("[export] AP=%s ip=%s\n",AP_SSID,WiFi.softAPIP().toString().c_str());
+}
+// Reboot rather than tear down: restarting is the one reliable way back to a full-speed BLE radio
+// after WiFi has run (same reason setup() reboots after its NTP sync). Clock and history survive.
+void exitExport(){
+  Serial.println("[export] resuming monitoring");
+  if(g_http){ g_http->stop(); }
+  WiFi.softAPdisconnect(true); WiFi.mode(WIFI_OFF);
+  delay(150); ESP.restart();
+}
+
+// Gestures resolve on lift-off, not on contact: a swipe begins as a touch, so acting on the first
+// sample would fire the tap action at the start of every swipe.
+// Returns 0 none, 1 tap (position in tx,ty), 2 swipe up, 3 swipe down.
+bool g_touching=false;
+int readGesture(int& tx,int& ty){
+  static int x0,y0,x1,y1; static uint32_t t0=0;
+  int sx,sy; bool now=touchXY(sx,sy);
+  if(now){
+    if(!g_touching){ g_touching=true; x0=x1=sx; y0=y1=sy; t0=millis(); }
+    else { x1=sx; y1=sy; }
+    return 0;
+  }
+  if(!g_touching) return 0;
+  g_touching=false;
+  int dx=x1-x0, dy=y1-y0;
+  if(abs(dy)>=SWIPE_MIN_DY && abs(dy)>abs(dx)) return dy<0 ? 2 : 3;
+  if(abs(dx)<=TAP_MAX_MOVE && abs(dy)<=TAP_MAX_MOVE && millis()-t0<600){ tx=x0; ty=y0; return 1; }
+  return 0;                                      // too short for a swipe, too smeared for a tap
 }
 
 void bootMsg(const char* s){ tft.fillScreen(BG); tft.setFont(&fonts::FreeSans9pt7b);
@@ -373,13 +514,25 @@ void setup(){
 }
 
 void loop(){
-  // touch handling (debounced)
-  static uint32_t lastTouch=0; int sx,sy;
-  if(touchXY(sx,sy) && millis()-lastTouch>250){
+  static uint32_t lastTouch=0;
+  int tx=0,ty=0; int g=readGesture(tx,ty);
+
+  // Export mode owns the loop: no BLE, no live view, just serve the page until told to stop.
+  if(view==EXPORT){
+    g_http->handleClient();
+    if(g==3 || millis()-g_exportStart>EXPORT_TIMEOUT_MS) exitExport();   // reboots, never returns
+    static uint32_t lastCd=0;
+    if(millis()-lastCd>1000){ lastCd=millis(); drawExportCountdown(); }
+    delay(5);                                    // keep the server responsive
+    return;
+  }
+  if(g==2 && view==LIVE){ enterExport(); return; }   // swipe up -> share the logged data
+
+  if(g==1){
     lastTouch=millis();
     if(view==LIVE){
-      if(sy>=HDR){                              // tap a column (number or its sparkline) -> 24h chart
-        plotMetric = (sx<COLW)?0:1; view=PLOT; drawPlot();
+      if(ty>=HDR){                              // tap a column (number or its sparkline) -> 24h chart
+        plotMetric = (tx<COLW)?0:1; view=PLOT; drawPlot();
       }
     } else { // PLOT: any tap cycles the bin size
       plotBinMin = (plotBinMin==60)?30:(plotBinMin==30)?15:60; drawPlot();
@@ -401,5 +554,5 @@ void loop(){
     int mod=minuteOfDay(); if(mod>=0) addReading(g_hr,g_spo2,mod);
     pushHist(g_hr,g_spo2);                       // feed the 1-hour sparklines
   }
-  delay(60);
+  delay(g_touching?15:60);                       // sample faster mid-gesture so swipes track well
 }

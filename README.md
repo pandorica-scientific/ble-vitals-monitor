@@ -178,15 +178,63 @@ above it are the radio and the backlight.
 
 | Setting | Why it is where it is |
 |---|---|
-| `SCAN_INTERVAL_MS 1000` / `SCAN_WINDOW_MS 300` | Receiving costs ~90–100 mA. The wristband advertises every ~1.5 s and only produces a new heart rate every ~20 s, so listening 30 % of the time loses nothing. Lower the window to save more. |
+| `SCAN_INTERVAL_MS 1000` / `SCAN_WINDOW_MS 500` | Receiving costs ~90–100 mA and the old 99 %-duty scan dominated the budget for no benefit — the wristband advertises every ~1.5 s and only produces a new heart rate every ~20 s. 50 % is as low as this board goes reliably; see the measurements below. |
 | `BRIGHT_DAY 140` | Backlight current tracks the PWM duty closely, so this is about half the power of full brightness and still easily readable indoors. |
 | `BRIGHT_NIGHT 1` | Lowest non-zero step. `0` switches the backlight off entirely. |
 
-> **Powering it from a USB power bank?** Expect **roughly 2 days from a 10 000 mAh bank** — that
-> rating is at the 3.7 V cell, so after the boost to 5 V you actually get ~6 000–6 500 mAh. Two more
-> things to know. Some banks cut power when the draw stays under ~50–100 mA, which the dimmed night
-> load can trigger; if yours switches itself off overnight, raise `BRIGHT_NIGHT` a few steps. And a
-> mains USB charger has no low-load cutoff and no runtime limit, so it sidesteps both problems.
+**Don't lower `SCAN_WINDOW_MS` without re-measuring.** Reception degrades much faster than the duty
+ratio suggests, because rendering and SD writes compete with the radio. Worst gap between decoded
+advertisements, measured on this board with the full firmware running, over ~3 minutes each:
+
+| Window / interval | Duty | Adverts per 30 s | Worst gap | Verdict |
+|---|---|---|---|---|
+| 99 / 100 | 99 % | ~51 | — | the old setting |
+| 500 / 1000 | 50 % | ~29 | **2.0 s** | comfortable — shipped |
+| 300 / 1000 | 30 % | ~15 | **13.0 s** | too close to `STALE_MS`, drops to `--` |
+
+> **Powering it from a USB power bank?** The original firmware got **about 2 days from a 10 000 mAh
+> bank** — that rating is at the 3.7 V cell, so after the boost to 5 V you actually get
+> ~6 000–6 500 mAh. The settings above should stretch that to roughly 3–3.5 days. Two more things to
+> know. Some banks cut power when the draw stays under ~50–100 mA, which the dimmed night load can
+> trigger; if yours switches itself off overnight, raise `BRIGHT_NIGHT` a few steps. And a mains USB
+> charger has no low-load cutoff and no runtime limit, so it sidesteps both problems.
+
+### Getting the data off the board
+
+**Swipe up** on the live view and the board stops scanning, becomes its own Wi-Fi access point and
+serves the logged CSVs to a phone. The screen shows everything you need — network name, password
+and address — so there is nothing to configure and nothing to remember. **Swipe down** to go back
+to monitoring, or just wait: it returns on its own after 10 minutes.
+
+Because the board *is* the network, this works anywhere — a doctor's office, a car, a basement.
+No home Wi-Fi, no phone hotspot, no internet, and the SD card never leaves the slot.
+
+| | |
+|---|---|
+| Network | `BabyVitals` (WPA2, password `babyvitals`) |
+| Address | `http://192.168.4.1` |
+| Returns to monitoring | swipe down, or automatically after 10 min |
+
+> **Monitoring is paused the whole time the access point is up**, and the screen says so in red.
+> Wi-Fi and BLE cannot share this radio without wrecking reception (the same reason the firmware
+> reboots after its NTP sync), so export mode stops scanning outright rather than quietly
+> degrading it. The swipe has to cross more than half the screen and be clearly vertical, so
+> brushing the display while moving the board will not trigger it.
+
+The page itself does the work — the ESP32 only ships bytes, so the charts can be interactive
+without costing the board anything. Pick a range (7 / 14 / 30 days or everything) and it shows
+median and daily range for heart rate and SpO₂, a tappable day-by-day breakdown, per-day coverage,
+and time spent outside the thresholds. **Save to phone** bundles it all into a single self-contained
+`.html` file (~275 KB for a month) that opens later with no board and no network — which is the
+version to actually show at an appointment.
+
+> The report states plainly that this is a home-built receiver rather than a medical device, and
+> shows a **coverage** figure for every day. A wrist sensor drops out when the baby moves, so low
+> readings are often motion artefacts; coverage is what tells you how much to trust a given day.
+
+Only `/vitals_*.csv` files are ever served. That is a deliberate whitelist rather than a path
+lookup, because `/wifi.txt` on the same card holds your **home** Wi-Fi password in plain text and
+anyone in the room can join the access point while it is up.
 
 **CSV logs** — one file per day on the SD card, e.g. `/vitals_2026-08-07.csv`:
 
