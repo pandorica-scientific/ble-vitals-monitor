@@ -228,6 +228,14 @@ and time spent outside the thresholds. **Save to phone** bundles it all into a s
 `.html` file (~275 KB for a month) that opens later with no board and no network — which is the
 version to actually show at an appointment.
 
+![The report page: 30-day summary with median and daily range for heart rate and SpO₂](docs/images/report-overview.jpg)
+
+Tap any day in either chart and it expands hour by hour, with the full table underneath:
+
+![Single-day view: the selected day hour by hour, above the per-day detail table](docs/images/report-single-day.jpg)
+
+> Screenshots use synthetic sample data, not a real baby's readings.
+
 > The report states plainly that this is a home-built receiver rather than a medical device, and
 > shows a **coverage** figure for every day. A wrist sensor drops out when the baby moves, so low
 > readings are often motion artefacts; coverage is what tells you how much to trust a given day.
