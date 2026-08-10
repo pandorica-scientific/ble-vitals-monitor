@@ -35,6 +35,7 @@ static const char APP_HTML[] PROGMEM = R"rawliteral(<!doctype html>
   section{margin:0 0 22px}
   h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);
      margin:0 0 8px;font-weight:600}
+  .metric-title{font-size:12px;color:var(--mut);font-weight:600;margin:10px 0 4px}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:10px 12px}
   .card .k{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
@@ -210,27 +211,31 @@ function bandChart(data,key,color,yLo,yHi,refs,w){
   return s+'</svg>';
 }
 
-// A single day, 96 quarter-hour bins across midnight to midnight.
-function dayChart(d,w){
+// A single metric from one day, 96 quarter-hour bins across midnight to midnight.
+function dayChart(d,key,color,yLo,yHi,refs,w){
   var h=170, pad={l:40,r:16,t:10,b:24};
-  var iw=w-pad.l-pad.r, ih=h-pad.t-pad.b, yLo=40,yHi=200;
+  var iw=w-pad.l-pad.r, ih=h-pad.t-pad.b;
   var Y=function(v){ return pad.t+ih-(Math.max(yLo,Math.min(yHi,v))-yLo)/(yHi-yLo)*ih };
   var s='<svg viewBox="0 0 '+w+' '+h+'" width="'+w+'" height="'+h+'">',i;
   for(i=0;i<=4;i++){ var v=yLo+(yHi-yLo)*i/4,y=Y(v);
     s+='<line x1="'+pad.l+'" y1="'+y+'" x2="'+(w-pad.r)+'" y2="'+y+'" stroke="#e5e7eb"/>'+
        '<text x="'+(pad.l-6)+'" y="'+(y+4)+'" text-anchor="end" font-size="10" fill="#6b7280">'+
        Math.round(v)+'</text>' }
+  for(i=0;i<refs.length;i++) s+='<line x1="'+pad.l+'" y1="'+Y(refs[i])+'" x2="'+(w-pad.r)+
+    '" y2="'+Y(refs[i])+'" stroke="#b45309" stroke-dasharray="4 3" stroke-width="1"/>';
   for(i=0;i<=24;i+=3){ var x=pad.l+i/24*iw;
     s+='<line x1="'+x+'" y1="'+pad.t+'" x2="'+x+'" y2="'+(pad.t+ih)+'" stroke="#f3f4f6"/>'+
        '<text x="'+x+'" y="'+(h-6)+'" text-anchor="middle" font-size="9" fill="#6b7280">'+i+'</text>' }
-  var band="",line="";
-  for(i=0;i<96;i++){ var b=d.prof[i]; if(!b||!b.h) continue;
+  var band="",line="",drawing=false;
+  for(i=0;i<96;i++){ var b=d.prof[i], metric=b&&b[key];
+    if(!metric){ drawing=false; continue }
     var x=pad.l+(i+.5)/96*iw;
-    band+='<line x1="'+x+'" y1="'+Y(b.h.min)+'" x2="'+x+'" y2="'+Y(b.h.max)+
-          '" stroke="#c0324b" stroke-opacity=".25" stroke-width="5"/>';
-    line+=(line?"L":"M")+x+" "+Y(b.h.med)+" ";
+    band+='<line x1="'+x+'" y1="'+Y(metric.min)+'" x2="'+x+'" y2="'+Y(metric.max)+
+          '" stroke="'+color+'" stroke-opacity=".25" stroke-width="5"/>';
+    line+=(drawing?"L":"M")+x+" "+Y(metric.med)+" ";
+    drawing=true;
   }
-  s+=band+'<path d="'+line+'" fill="none" stroke="#c0324b" stroke-width="1.6"/>';
+  s+=band+'<path d="'+line+'" fill="none" stroke="'+color+'" stroke-width="1.6"/>';
   return s+'</svg>';
 }
 
@@ -284,7 +289,10 @@ function render(){
     '<div class="wrap" id="c2"></div></section>';
 
   html+='<section id="daydetail"><h2>Single day'+(sel?" — "+esc(sel):"")+'</h2>'+
-    (sel?'<div class="wrap" id="c3"></div>':'<div class="note">Tap any point above to see that '+
+    (sel?'<div class="metric-title">Heart rate — 15-minute median and range</div>'+
+     '<div class="wrap" id="c3"></div>'+
+     '<div class="metric-title">Oxygen saturation — 15-minute median and range</div>'+
+     '<div class="wrap" id="c4"></div>':'<div class="note">Tap any point above to see that '+
      'day hour by hour.</div>')+'</section>';
 
   html+='<section><h2>Daily detail</h2><div class="wrap"><table><thead><tr>'+
@@ -321,9 +329,14 @@ function drawCharts(){
   var c2=document.getElementById("c2");
   c2.innerHTML=bandChart(days,"ox","#2563a6",80,100,[SPO2_LOW],w);
   bindChart(c2,days,"ox","%");
-  var c3=document.getElementById("c3");
-  if(c3&&sel) for(var i=0;i<days.length;i++)
-    if(days[i].date===sel) c3.innerHTML=dayChart(days[i],Math.max(avail,460));
+  var c3=document.getElementById("c3"), c4=document.getElementById("c4"), selectedDay=null;
+  if((c3||c4)&&sel) for(var i=0;i<days.length;i++)
+    if(days[i].date===sel){ selectedDay=days[i]; break }
+  var dayWidth=Math.max(avail,460);
+  if(c3&&selectedDay)
+    c3.innerHTML=dayChart(selectedDay,"h","#c0324b",40,200,[HR_LOW,HR_HIGH],dayWidth);
+  if(c4&&selectedDay)
+    c4.innerHTML=dayChart(selectedDay,"o","#2563a6",80,100,[SPO2_LOW],dayWidth);
 }
 var rzT=null;
 window.addEventListener("resize",function(){ clearTimeout(rzT); rzT=setTimeout(drawCharts,150) });
@@ -359,6 +372,6 @@ function saveReport(){
 }
 
 buildBar();
-if(embedded){ render() } else { load(7) }
+if(embedded){ days=embedded.days; render() } else { load(7) }
 </script>
 </body></html>)rawliteral";

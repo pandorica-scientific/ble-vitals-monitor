@@ -108,8 +108,12 @@ Uses [`arduino-cli`](https://arduino.github.io/arduino-cli/) and the ESP32 Ardui
 ```bash
 # one-time setup
 arduino-cli core update-index
-arduino-cli core install esp32:esp32
-arduino-cli lib install "LovyanGFX"
+arduino-cli core install esp32:esp32@3.3.11
+arduino-cli lib install "LovyanGFX@1.2.26"
+
+# native firmware-logic tests
+c++ -std=c++17 -Wall -Wextra -Werror tests/firmware_logic_test.cpp -o scratch-workspace/firmware_logic_test
+scratch-workspace/firmware_logic_test
 
 # compile + flash the main firmware (adjust the serial port)
 PORT=/dev/cu.usbserial-XXXX
@@ -127,27 +131,40 @@ Notes:
 
 ## First-time setup (WiFi & SD)
 
-The firmware reads WiFi credentials from **`/wifi.txt`** on the SD card (line 1 = SSID, line 2 =
-password) and uses them **only** to sync the clock over NTP, then turns WiFi off so BLE runs
-clean.
+The firmware keeps three independent credential slots on the SD card:
+
+- **`/wifi.txt`** — primary network;
+- **`/wifi_backup.txt`** — first fallback network;
+- **`/wifi_backup2.txt`** — second fallback network, such as another phone hotspot.
+
+Each file contains the SSID on line 1 and password on line 2. The networks are used **only** to
+sync the clock over Network Time Protocol (NTP) at boot; WiFi is then fully turned off so BLE runs
+cleanly.
 
 The SD card is wired to the ESP32, not to your computer, so you can't drop the file on it via a
 card reader unless you remove the card. Two options:
 
-1. **Provision from the ESP32** (no card reader needed): open
-   `firmware/provision_wifi/provision_wifi.ino`, put your SSID/password in the two `REDACTED`
-   fields, flash it once (it writes and verifies `/wifi.txt`), then flash `cyd_vitals` and
-   **clear your credentials back out of the sketch**.
-2. **Card reader**: create `/wifi.txt` on the card directly.
+1. **Provision from the ESP32** (no card reader needed): flash `firmware/provision_wifi`, open a
+   115200-baud serial monitor, choose `primary`, `backup`, or `backup2`, and enter the credentials at its
+   prompts. The provisioner transactionally replaces and verifies only the selected slot, tests
+   that network for up to 15 seconds, and never embeds or prints the credential values. Repeat it
+   to configure the other slots, then flash `cyd_vitals`.
+2. **Card reader**: create `/wifi.txt`, `/wifi_backup.txt`, `/wifi_backup2.txt`, or any combination
+   directly on the card using the same two-line format.
+
+Enable a fallback phone hotspot before resetting the monitor away from home; boot-time attempts
+are intentionally finite and WiFi is never retried while live Bluetooth monitoring is running.
 
 Timezone is set to **Europe/Warsaw** (CET/CEST with DST) in `cyd_vitals.ino` — change the
 `setenv("TZ", ...)` / `configTzTime(...)` strings for your region.
 
-**Boot behavior (normal):** on a cold power-up the device connects to WiFi, sets its clock via
-NTP, then **soft-reboots itself once** and comes up in BLE-only mode. This is intentional — the
-ESP32's WiFi/BLE radio *coexistence* severely throttles BLE reception, so the firmware uses WiFi
-only briefly for the clock (which survives the reboot) and then runs Bluetooth at full strength.
-Expect a ~15 s boot with one automatic restart.
+**Boot behavior (normal):** on a cold power-up without valid time, the device tries the primary
+network for up to 15 seconds and, after connection, NTP for up to 15 seconds. If that slot does not
+obtain time, it disconnects and gives `backup`, then `backup2`, the same bounded attempt. Success
+causes one intentional **soft reboot** into BLE-only mode. If all three slots fail, monitoring starts without
+clock-based CSV logging or night mode; a later reset retries. This avoids WiFi/BLE coexistence,
+which severely throttles reception. The worst case before monitoring starts is about 60 seconds
+for two slots and about 90 seconds for all three when networks connect slowly or NTP times out.
 
 ---
 
@@ -156,6 +173,13 @@ Expect a ~15 s boot with one automatic restart.
 **Live view** — big Heart rate and SpO₂ up top, skin temperature small next to the name, and a
 1-hour BPM and SpO₂ sparkline (with yellow/red warning lines) along the bottom; time and signal in
 the header. Values turn red past (configurable, non-medical) alert thresholds.
+
+The live header reports what the receiver can actually distinguish:
+
+- **`scan`** — the 30-second scan-start grace period;
+- the normal **`sig`** value — wristband packets are arriving;
+- **`BAND / RANGE`** — other Bluetooth traffic is arriving, but the wristband is not;
+- **`RADIO RETRY`** — all Bluetooth traffic stopped and rate-limited scanner recovery is active.
 
 **24-hour charts** — tap the **HEART** or **OXYGEN** column (number or sparkline) to open a
 full-screen 0:00→24:00 plot showing the **average ± standard deviation** per time-bin. Tap the
@@ -181,8 +205,6 @@ above it are the radio and the backlight.
 | `SCAN_INTERVAL_MS 1000` / `SCAN_WINDOW_MS 500` | Receiving costs ~90–100 mA and the old 99 %-duty scan dominated the budget for no benefit — the wristband advertises every ~1.5 s and only produces a new heart rate every ~20 s. 50 % is as low as this board goes reliably; see the measurements below. |
 | `BRIGHT_DAY 140` | Backlight current tracks the PWM duty closely, so this is about half the power of full brightness and still easily readable indoors. |
 | `BRIGHT_NIGHT 1` | Lowest non-zero step. `0` switches the backlight off entirely. |
-| `KEEPALIVE_DUTY_PCT 60` | Deliberately *wastes* current so a power bank keeps seeing a load. Runs around the clock. See the power-bank note below. |
-| `SCAN_WINDOW_NIGHT_MS` | At night the radio goes to 100 % duty (window = interval). Partly to draw current, partly because a sleeping baby is when dropouts matter most. |
 
 **Don't lower `SCAN_WINDOW_MS` without re-measuring.** Reception degrades much faster than the duty
 ratio suggests, because rendering and SD writes compete with the radio. Worst gap between decoded
@@ -194,32 +216,14 @@ advertisements, measured on this board with the full firmware running, over ~3 m
 | 500 / 1000 | 50 % | ~29 | **2.0 s** | comfortable — shipped |
 | 300 / 1000 | 30 % | ~15 | **13.0 s** | too close to `STALE_MS`, drops to `--` |
 
-> **Powering it from a USB power bank?** Many banks cut their output when the draw stays under
-> ~50–100 mA, and they judge that on the **average** current over a multi-second window, not on
-> peaks. Dimming the backlight at night pushes this board under that line, and the bank switches
-> itself off — observed here roughly an hour after the night window opened.
->
-> The fix is `KEEPALIVE_DUTY_PCT`: the firmware holds a deliberate load — a CPU spin plus read-only
-> reads of today's CSV — for that percentage of every 200 ms slice, around the clock. Both loads are
-> silent and dark, so the room stays dark. A first attempt used a 120 ms burst every 8 s and **did
-> not work**: 1.5 % duty moves the average by well under 1 mA. Short spikes are not enough; only a
-> genuinely higher sustained average is.
->
-> If the bank still cuts out, raise `KEEPALIVE_DUTY_PCT`. Once it survives a night, step it back
-> down (60 → 45 → 30) to find the margin. Raising `BRIGHT_NIGHT` also works and is the bigger lever,
-> but it lights up the room, which is the thing night mode exists to prevent.
->
-> **This trades runtime for reliability, on purpose.** The original firmware got about 2 days from a
-> 10 000 mAh bank — that rating is at the 3.7 V cell, so after the boost to 5 V you actually get
-> ~6 000–6 500 mAh. Burning current to stay alive gives that back up; expect roughly 1.5–2 days
-> rather than the 3–3.5 the efficiency settings alone would allow. A mains USB charger has no
-> low-load cutoff and no runtime limit, so it sidesteps the whole problem — and if the board is
-> permanently by a cot, that is the better supply.
+> Use a stable, regulated 5 V USB supply. The firmware adds no dummy workload for a power bank.
+> If a battery supply is required, choose one whose exact output is explicitly
+> documented as always-on at low current.
 >
 > **`/boot.log` on the SD card** records why each restart happened, so you can tell these apart
-> without a current meter: `POWERON` means the supply was cut and came back (bank cutoff — raise the
-> duty), `BROWNOUT` means the 5 V rail sagged (cable or current limit — more load makes it *worse*),
-> and `PANIC`/`TASK_WDT` mean the firmware crashed, which no keep-alive setting will fix.
+> without a current meter: `POWERON` records a cold boot or supply interruption but does not identify
+> its cause; `BROWNOUT` means the ESP32 supply fell too low; and `PANIC`/`TASK_WDT` indicate a
+> firmware failure.
 
 ### Getting the data off the board
 

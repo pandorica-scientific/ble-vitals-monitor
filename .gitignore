@@ -1,6 +1,10 @@
 # Secrets — never commit WiFi credentials
 wifi.txt
 **/wifi.txt
+wifi_backup.txt
+**/wifi_backup.txt
+wifi_backup2.txt
+**/wifi_backup2.txt
 
 # Captured data / logs
 *.csv
@@ -21,3 +25,4 @@ mac/babysensor_reader
 
 # local scratch (see global preferences)
 scratch-workspace/
+/docs/superpowers

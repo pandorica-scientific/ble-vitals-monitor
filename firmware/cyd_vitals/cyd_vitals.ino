@@ -7,8 +7,8 @@
 // Also: WiFi+NTP clock (Europe/Warsaw) synced once at boot then reboots BLE-only (coexistence),
 //   per-reading CSV logging to microSD (one file per day), and a backlight that drops to its
 //   lowest step between 20:00 and 08:00 so it doesn't light up the room at night.
-// Power: the BLE scan is duty-cycled and the daytime backlight runs below full, because the
-//   whole board lives off a USB power bank (see SCAN_* and BRIGHT_DAY below).
+// Power: use a stable regulated 5 V supply. The BLE scan is duty-cycled and the daytime
+//   backlight runs below full to avoid unnecessary work and heat (see SCAN_* and BRIGHT_DAY).
 // Export: swipe UP on the live view and the board becomes its own WiFi access point serving the
 //   logged CSVs to a phone, so a week or a month can be pulled anywhere without removing the SD
 //   card. Swipe DOWN (or wait out the timeout) to resume. Monitoring is PAUSED while it is up.
@@ -30,14 +30,16 @@
 #include <WebServer.h>
 #include <time.h>
 #include <math.h>
+#include "band_protocol.h"
+#include "live_render_key.h"
+#include "radio_health.h"
+#include "wifi_failover.h"
 #include "app_html.h"      // the report page served in export mode (PROGMEM)
 
 #define ROTATION 0
 #define HR_LOW 90
 #define HR_HIGH 180
 #define SPO2_LOW 90
-#define SKIN_MIN 28.0f
-#define SKIN_MAX 42.0f
 #define STALE_MS 30000
 // backlight: dim overnight so the display doesn't light up the room
 #define NIGHT_START_MIN (20*60)   // 20:00 -> dim
@@ -57,31 +59,6 @@
 // Re-measure the worst gap against STALE_MS before lowering the window.
 #define SCAN_INTERVAL_MS 1000     // how often a scan window starts
 #define SCAN_WINDOW_MS   500      // how long the radio listens inside that window
-// ---- power-bank keep-alive (v2) ----
-// Most USB power banks cut their output when the load stays under ~50-100 mA, and they judge that
-// on the AVERAGE current over a multi-second window, not on peaks.
-// v1 tried a 120 ms burst every 8 s. That is 1.5% duty: even a generous +50 mA burst lifts the
-// average by ~0.75 mA, so the bank never noticed and still cut out overnight. Peaks do not work;
-// only a genuinely higher sustained average does.
-// v2 therefore holds an artificial load for a large fraction of every slice, around the clock.
-// Both loads are silent and invisible - no backlight flash, so the room stays dark at night:
-//   - a CPU spin, which also stops loop()'s delay() parking the core in its low-power idle
-//   - repeated 512 B reads of today's CSV. READ-only, so it costs no write wear on the card.
-// The load runs in short slices rather than one long block so touch stays responsive.
-// Cost: this deliberately burns current, so a bank that is NOT on mains pass-through will run flat
-// sooner. Rough order of magnitude on a 10 Ah bank, ~6 Ah usable at 5 V: several days either way,
-// so the trade is worth it - but if you ever run this off a charge rather than a socket, expect it.
-#define KEEPALIVE_DUTY_PCT  60    // percent of each slice spent under load. 0 = off.
-                                  // Start high: another failed night costs a whole night of data.
-                                  // Once it survives, step down 60 -> 45 -> 30 to find the margin.
-#define KEEPALIVE_SLICE_MS  200   // load/idle slice. 60% -> 120 ms load, 80 ms normal loop work.
-#define KEEPALIVE_NIGHT_ONLY 0    // 0 = run around the clock. The daytime backlight probably carries
-                                  // the load on its own, but "probably" is not worth a missed night:
-                                  // a bank that cuts out at noon loses just as much data.
-// At night the BLE radio also goes to 100% duty: interval == window. Receiving is one of the few
-// big silent loads available, and it doubles as better overnight capture - fewer "--" dropouts at
-// exactly the hours the monitor matters most. Costs ~40 mA, which is the point.
-#define SCAN_WINDOW_NIGHT_MS SCAN_INTERVAL_MS
 // ---- data export mode: swipe UP from the live view, swipe DOWN to resume ----
 // The board becomes its own WiFi access point and serves the logged CSVs to a phone, so the data
 // can be pulled anywhere (a doctor's office) with no home network, no hotspot and no SD removal.
@@ -129,10 +106,143 @@ LGFX tft;
 SPIClass sdSPI(VSPI);
 
 // ---------- shared vitals ----------
-volatile int   g_hr=0, g_spo2=0, g_sig=0, g_rssi=0, g_seq=-1;
-volatile float g_skin=0;
-volatile bool  g_skinValid=false;
-volatile uint32_t g_lastMs=0;
+ReadingSnapshot g_reading;
+portMUX_TYPE g_readingMux = portMUX_INITIALIZER_UNLOCKED;
+
+ReadingSnapshot readSnapshot() {
+  portENTER_CRITICAL(&g_readingMux);
+  ReadingSnapshot copy = g_reading;
+  portEXIT_CRITICAL(&g_readingMux);
+  return copy;
+}
+
+void publishReading(const BandReading& frame, int rssi, uint32_t nowMs) {
+  portENTER_CRITICAL(&g_readingMux);
+  g_reading = mergeBandReading(g_reading, frame, rssi, nowMs);
+  portEXIT_CRITICAL(&g_readingMux);
+}
+
+void holdSkinTemperature(float skinC) {
+  if (skinC < BAND_SKIN_MIN_C || skinC > BAND_SKIN_MAX_C) return;
+  portENTER_CRITICAL(&g_readingMux);
+  g_reading.skinC = skinC;
+  g_reading.skinValid = true;
+  portEXIT_CRITICAL(&g_readingMux);
+}
+
+// ---------- protected Bluetooth health telemetry ----------
+struct RadioRuntime {
+  bool scanStarted = false;
+  uint32_t scanStartedMs = 0;
+  bool anySeen = false;
+  uint32_t lastAnyMs = 0;
+  bool bandSeen = false;
+  uint32_t lastBandMs = 0;
+  uint32_t totalAdvertisements = 0;
+  uint32_t bandAdvertisements = 0;
+  bool restartAttempted = false;
+  uint32_t lastRestartAttemptMs = 0;
+  uint32_t restartCount = 0;
+};
+
+RadioRuntime g_radio;
+portMUX_TYPE g_radioMux = portMUX_INITIALIZER_UNLOCKED;
+BLEScan* g_bleScanner = nullptr;
+
+RadioRuntime readRadioRuntime();
+RadioState classifyRadio(uint32_t nowMs, const RadioRuntime& radio);
+
+RadioRuntime readRadioRuntime() {
+  portENTER_CRITICAL(&g_radioMux);
+  RadioRuntime copy = g_radio;
+  portEXIT_CRITICAL(&g_radioMux);
+  return copy;
+}
+
+void noteAnyAdvertisement(uint32_t nowMs) {
+  portENTER_CRITICAL(&g_radioMux);
+  g_radio.anySeen = true;
+  g_radio.lastAnyMs = nowMs;
+  ++g_radio.totalAdvertisements;
+  portEXIT_CRITICAL(&g_radioMux);
+}
+
+void noteBandAdvertisement(uint32_t nowMs) {
+  portENTER_CRITICAL(&g_radioMux);
+  g_radio.bandSeen = true;
+  g_radio.lastBandMs = nowMs;
+  ++g_radio.bandAdvertisements;
+  portEXIT_CRITICAL(&g_radioMux);
+}
+
+bool startBleScan(uint32_t nowMs) {
+  g_bleScanner->setActiveScan(false);
+  g_bleScanner->setInterval(SCAN_INTERVAL_MS);
+  g_bleScanner->setWindow(SCAN_WINDOW_MS);
+  bool started = g_bleScanner->start(0, nullptr, false);
+  portENTER_CRITICAL(&g_radioMux);
+  g_radio.scanStarted = started;
+  g_radio.scanStartedMs = nowMs;
+  portEXIT_CRITICAL(&g_radioMux);
+  Serial.printf("[ble] scan start %s\n", started ? "OK" : "FAILED");
+  return started;
+}
+
+RadioState classifyRadio(uint32_t nowMs, const RadioRuntime& radio) {
+  RadioHealthInput input{};
+  input.nowMs = nowMs;
+  input.scanStarted = radio.scanStarted;
+  input.scanStartedMs = radio.scanStartedMs;
+  input.anySeen = radio.anySeen;
+  input.lastAnyMs = radio.lastAnyMs;
+  input.bandSeen = radio.bandSeen;
+  input.lastBandMs = radio.lastBandMs;
+  return classifyRadioHealth(input);
+}
+
+const char* radioStateLabel(RadioState state) {
+  switch (state) {
+    case RadioState::STARTING: return "STARTING";
+    case RadioState::RECEIVING: return "RECEIVING";
+    case RadioState::BAND_MISSING: return "BAND_MISSING";
+    case RadioState::SCANNER_SILENT: return "SCANNER_SILENT";
+  }
+  return "UNKNOWN";
+}
+
+RadioState serviceRadioRecovery(uint32_t nowMs) {
+  RadioRuntime radio = readRadioRuntime();
+  RadioState state = classifyRadio(nowMs, radio);
+  static bool havePrevious = false;
+  static RadioState previous = RadioState::STARTING;
+
+  if (!havePrevious || state != previous) {
+    Serial.printf("[ble] state=%s total=%lu band=%lu restarts=%lu\n",
+                  radioStateLabel(state),
+                  static_cast<unsigned long>(radio.totalAdvertisements),
+                  static_cast<unsigned long>(radio.bandAdvertisements),
+                  static_cast<unsigned long>(radio.restartCount));
+    previous = state;
+    havePrevious = true;
+  }
+
+  if (!shouldRestartScan(state, radio.restartAttempted, nowMs,
+                         radio.lastRestartAttemptMs)) {
+    return state;
+  }
+
+  portENTER_CRITICAL(&g_radioMux);
+  g_radio.restartAttempted = true;
+  g_radio.lastRestartAttemptMs = nowMs;
+  ++g_radio.restartCount;
+  portEXIT_CRITICAL(&g_radioMux);
+
+  if (radio.scanStarted) g_bleScanner->stop();
+  delay(20);
+  startBleScan(millis());
+  return classifyRadio(millis(), readRadioRuntime());
+}
+
 bool g_timeReady=false, g_sdReady=false;
 RTC_DATA_ATTR bool g_syncedThisPower=false;   // survives the soft reboot below
 // The real reason this power cycle started, carried across the deliberate NTP soft-reboot below.
@@ -141,10 +251,6 @@ RTC_DATA_ATTR bool g_syncedThisPower=false;   // survives the soft reboot below
 // ESP.restart(). RTC memory survives a SW reset but not a power cut, which is exactly the
 // distinction logBoot() needs.
 RTC_DATA_ATTR esp_reset_reason_t g_origReason=ESP_RST_UNKNOWN;
-// NOT g_scan: the ESP32 WiFi blob (libnet80211.a) exports a global of that exact name and the
-// link fails with a multiple-definition error. Same trap as the TX1 macro clash.
-BLEScan* g_bleScan=nullptr;                   // kept so the night duty cycle can be retuned live
-
 // ---------- rolling ~1-hour history for the mini sparklines (~180 readings @ ~20s) ----------
 #define HN 180
 uint8_t hrHist[HN], spHist[HN]; int histHead=0, histCnt=0;
@@ -155,17 +261,18 @@ void pushHist(int hr,int sp){
 
 class CB : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
+    uint32_t nowMs = millis();
+    noteAnyAdvertisement(nowMs);
     if (!dev.haveManufacturerData()) return;
-    String m = dev.getManufacturerData();
-    if (m.length() < 23) return;
-    const uint8_t* b = (const uint8_t*)m.c_str();
-    if (b[0]!=0xF5 || b[1]!=0x03) return;
-    g_seq=b[2]; g_hr=b[10]; g_spo2=b[13]; g_sig=b[4]; g_rssi=dev.getRSSI();
-    // Skin temp = big-endian uint16 at bytes 6-7, divided by 10 (0.1C resolution). CONFIRMED.
-    // (byte 3 bit 0x08 flags a freshly-generated temperature; updates ~every 15 min.)
-    float sk = (((uint16_t)b[6]<<8) | b[7]) / 10.0f;
-    if (sk>=SKIN_MIN && sk<=SKIN_MAX) { g_skin=sk; g_skinValid=true; }
-    g_lastMs=millis();
+    String manufacturer = dev.getManufacturerData();
+    BandReading decoded{};
+    if (!decodeBandFrame(
+            reinterpret_cast<const uint8_t*>(manufacturer.c_str()),
+            manufacturer.length(), decoded)) {
+      return;
+    }
+    noteBandAdvertisement(nowMs);
+    publishReading(decoded, dev.getRSSI(), nowMs);
   }
 };
 
@@ -179,33 +286,103 @@ void addReading(int hr, int spo2, int minOfDay) {
 }
 
 // ---------- SD + WiFi + NTP ----------
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+constexpr uint32_t NTP_TIMEOUT_MS = 15000;
+constexpr char TZ_INFO[] = "CET-1CEST,M3.5.0,M10.5.0/3";
+constexpr char NTP_SERVER_1[] = "pool.ntp.org";
+constexpr char NTP_SERVER_2[] = "time.nist.gov";
+
+struct WifiCredential {
+  String ssid;
+  String password;
+};
+
+bool loadWifiCredential(WifiSlot slot, WifiCredential& out);
+bool tryWifiSlot(WifiSlot slot);
+
 bool initSD() {
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   g_sdReady = SD.begin(SD_CS, sdSPI) && SD.cardType()!=CARD_NONE;
   Serial.println(g_sdReady?"[SD] OK":"[SD] FAILED"); return g_sdReady;
 }
-void syncTimeOverWifi() {
-  if (!g_sdReady) return;
-  File f=SD.open("/wifi.txt"); if(!f){Serial.println("[wifi.txt] missing");return;}
-  String ssid=f.readStringUntil('\n'); ssid.trim();
-  String pass=f.readStringUntil('\n'); pass.trim(); f.close();
-  if(!ssid.length()) return;
-  WiFi.mode(WIFI_STA); WiFi.begin(ssid.c_str(),pass.c_str());
-  uint32_t t0=millis(); while(WiFi.status()!=WL_CONNECTED && millis()-t0<20000) delay(250);
-  if(WiFi.status()==WL_CONNECTED){
-    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3","pool.ntp.org","time.nist.gov");
-    struct tm tm; t0=millis(); while(!getLocalTime(&tm,200)&&millis()-t0<15000) delay(200);
-    if(getLocalTime(&tm)){ g_timeReady=true; char b[24]; strftime(b,24,"%F %T",&tm); Serial.printf("[ntp] %s\n",b);}
-  } else Serial.println("[wifi] FAILED");
-  // Fully release the radio to BLE (WIFI_OFF alone can leave coexistence throttling BLE)
-  WiFi.disconnect(true,true); WiFi.mode(WIFI_OFF); esp_wifi_stop(); esp_wifi_deinit();
+
+bool readLocalClock(struct tm& out) {
+  time_t now;
+  time(&now);
+  localtime_r(&now, &out);
+  return out.tm_year > 120;
+}
+
+bool loadWifiCredential(WifiSlot slot, WifiCredential& out) {
+  File file = SD.open(wifiCredentialPath(slot));
+  if (!file) return false;
+  out.ssid = file.readStringUntil('\n');
+  out.password = file.readStringUntil('\n');
+  file.close();
+  out.ssid.trim();
+  out.password.trim();
+  return out.ssid.length() > 0;
+}
+
+bool tryWifiSlot(WifiSlot slot) {
+  WifiCredential credential;
+  if (!loadWifiCredential(slot, credential)) {
+    credential.password = "";
+    Serial.printf("[wifi] %s unavailable\n", wifiSlotLabel(slot));
+    return false;
+  }
+
+  Serial.printf("[wifi] trying %s\n", wifiSlotLabel(slot));
+  WiFi.begin(credential.ssid.c_str(), credential.password.c_str());
+  uint32_t startedMs = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         static_cast<uint32_t>(millis() - startedMs) < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(250);
+  }
+
+  bool synced = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+    startedMs = millis();
+    struct tm localTime{};
+    while (static_cast<uint32_t>(millis() - startedMs) < NTP_TIMEOUT_MS) {
+      if (getLocalTime(&localTime, 200) && localTime.tm_year > 120) {
+        synced = true;
+        break;
+      }
+      delay(50);
+    }
+  }
+
+  Serial.printf("[wifi] %s %s\n", wifiSlotLabel(slot),
+                synced ? "time-synced" : "failed");
+  credential.password = "";
+  WiFi.disconnect(false, false);
+  delay(100);
+  return synced;
+}
+
+void shutdownWifi() {
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
+  esp_wifi_deinit();
+}
+
+bool syncTimeOverWifi() {
+  if (!g_sdReady) return false;
+  WiFi.mode(WIFI_STA);
+  bool synced = runWifiFailover(
+      [](WifiSlot slot) { return tryWifiSlot(slot); });
+  shutdownWifi();
+  return synced;
 }
 // One definition of the log filename: the writer (logRow) and the reader (loadCsvToday) must never
 // disagree about which file "today" is.
 void csvName(char* out,const struct tm* tm){ strftime(out,32,"/vitals_%Y-%m-%d.csv",tm); }
-void csvName(char* out){ struct tm tm; getLocalTime(&tm); csvName(out,&tm); }
+void csvName(char* out){ struct tm tm{}; if(readLocalClock(tm)) csvName(out,&tm); else out[0]='\0'; }
 void logRow(int hr,int spo2,float skin,bool sv){
-  if(!g_sdReady||!g_timeReady) return; struct tm tm; if(!getLocalTime(&tm)) return;
+  if(!g_sdReady||!g_timeReady) return; struct tm tm{}; if(!readLocalClock(tm)) return;
   char fn[32]; csvName(fn,&tm); bool isNew=!SD.exists(fn);
   File f=SD.open(fn,FILE_APPEND); if(!f) return;
   if(isNew) f.println("timestamp,hr_bpm,spo2_pct,skin_c");
@@ -227,17 +404,19 @@ void loadCsvToday(){
     addReading(hr,sp,hh*60+mm); pushHist(hr,sp); n++;   // last HN kept -> ~1h sparkline survives reboot
     // remember the last valid skin temp so the display holds it (like the app) instead of "--"
     if(c3>=0){ String sf=ln.substring(c3+1); sf.trim();
-      if(sf.length()){ float sk=sf.toFloat(); if(sk>=SKIN_MIN&&sk<=SKIN_MAX){ g_skin=sk; g_skinValid=true; } } }
+      if(sf.length()){ float sk=sf.toFloat(); if(sk>=BAND_SKIN_MIN_C&&sk<=BAND_SKIN_MAX_C){ holdSkinTemperature(sk); } } }
   }
-  f.close(); Serial.printf("[csv] loaded %d rows into bins (heldSkin=%.1f valid=%d)\n",n,g_skin,g_skinValid);
+  f.close();
+  ReadingSnapshot held = readSnapshot();
+  Serial.printf("[csv] loaded %d rows into bins (heldSkin=%.1f valid=%d)\n",n,held.skinC,held.skinValid);
 }
 // Why the board restarted, appended to its own file so the CSV format the report app parses is
 // untouched. There is no current meter on this build, so this is the only evidence that separates
 // the three candidate causes of a dead screen in the morning:
-//   POWERON  - the supply was cut and came back    -> power bank idle-cutoff, keep-alive too weak
-//   BROWNOUT - the 5 V rail sagged                 -> cable/bank current limit, NOT an idle cutoff
-//   PANIC/WDT/TASK_WDT - firmware crashed          -> a bug, and no keep-alive setting will fix it
-// A single POWERON at the time you plugged it in is normal. Extra entries overnight are the bug.
+//   POWERON  - cold boot or supply interruption    -> confirms neither the source nor the cause
+//   BROWNOUT - the ESP32 supply fell too low       -> check the 5 V source, cable and regulator
+//   PANIC/WDT/TASK_WDT - firmware crashed          -> investigate the software path
+// A single POWERON when you plug it in is normal. Extra entries overnight need investigation.
 void logBoot(){
   if(!g_sdReady || !g_timeReady) return;
   const char* r; switch(g_origReason){
@@ -250,15 +429,15 @@ void logBoot(){
   // The numeric code goes in too: a bare "OTHER" at 03:00 is a dead end, and the enum has more
   // members (USB, JTAG, CPU_LOCKUP, PWR_GLITCH) than are worth spelling out here.
   File f=SD.open("/boot.log",FILE_APPEND); if(!f) return;
-  struct tm tm; char ts[24]="?";
-  if(getLocalTime(&tm)) strftime(ts,24,"%F %T",&tm);
+  struct tm tm{}; char ts[24]="?";
+  if(readLocalClock(tm)) strftime(ts,24,"%F %T",&tm);
   f.printf("%s,%s,%d\n",ts,r,(int)g_origReason); f.close();
   Serial.printf("[boot] %s reset=%s(%d)\n",ts,r,(int)g_origReason);
 }
-bool nowHM(char* o){ struct tm tm; if(!getLocalTime(&tm))return false; strftime(o,8,"%H:%M",&tm); return true; }
-int minuteOfDay(){ struct tm tm; if(!getLocalTime(&tm))return -1; return tm.tm_hour*60+tm.tm_min; }
+bool nowHM(char* o){ struct tm tm{}; if(!readLocalClock(tm))return false; strftime(o,8,"%H:%M",&tm); return true; }
+int minuteOfDay(){ struct tm tm{}; if(!readLocalClock(tm))return -1; return tm.tm_hour*60+tm.tm_min; }
 // 20:00 -> 08:00 is "night": dim backlight + dark theme.
-// Gated on g_timeReady: with no clock getLocalTime() blocks, and the day look is the safe default.
+// Gated on g_timeReady: without a valid clock the day look is the safe default.
 bool isNight(){
   if(FORCE_NIGHT) return true;
   if(!g_timeReady) return false;
@@ -270,45 +449,6 @@ void setBacklight(int want){                     // single owner of the PWM; onl
   static int cur=-1; if(want!=cur){ tft.setBrightness(want); cur=want; }
 }
 void applyBrightness(){ setBacklight(wantBrightness()); }
-
-// Hold a silent artificial load so the power bank keeps seeing a real device (see KEEPALIVE_* above).
-// Called once per loop(); each call either runs one load slice or returns immediately.
-void keepAlive(){
-  if(!KEEPALIVE_DUTY_PCT) return;
-  if(KEEPALIVE_NIGHT_ONLY && !isNight()) return;   // by day the backlight already draws plenty
-  static uint32_t last=0;
-  if(millis()-last < KEEPALIVE_SLICE_MS) return;   // idle part of the slice: let loop() do its work
-  last=millis();
-
-  // Read-only handle on today's log. Reopened per slice on purpose: the file the writer appends to
-  // changes at midnight, and a stale handle would pin the previous day's file open all night.
-  File f; if(g_sdReady && g_timeReady){ char fn[32]; csvName(fn); f=SD.open(fn); }
-  uint8_t buf[512]; volatile float spin=1.0f;
-  uint32_t on=(uint32_t)KEEPALIVE_SLICE_MS*KEEPALIVE_DUTY_PCT/100, t0=millis();
-  while(millis()-t0 < on){
-    if(f){ if(!f.available()) f.seek(0); f.read(buf,sizeof(buf)); }
-    for(int i=0;i<2000;i++) spin=spin*1.000001f+0.5f;
-  }
-  if(f) f.close();
-}
-
-// 100% BLE duty while dimmed, the measured 50% duty by day. Only touches the radio on an actual
-// day/night transition, i.e. twice a day.
-// The scan MUST be stopped and restarted: setWindow() only writes BLEScan::m_scan_params, and those
-// are pushed to the controller by esp_ble_gap_set_scan_params() inside start(). Calling setWindow()
-// on a running scan changes nothing at all - it fails silently, which is why this is worth a comment.
-void applyScanDuty(){
-  if(!g_bleScan) return;
-  static int cur=-1; int n=isNight()?1:0;
-  if(n==cur) return; cur=n;
-  g_bleScan->stop();
-  g_bleScan->setInterval(SCAN_INTERVAL_MS);
-  g_bleScan->setWindow(n?SCAN_WINDOW_NIGHT_MS:SCAN_WINDOW_MS);
-  g_bleScan->start(0,nullptr,false);
-  Serial.printf("[keepalive] %s: scan %d/%d ms, load duty=%d%%\n",
-                n?"night":"day", n?SCAN_WINDOW_NIGHT_MS:SCAN_WINDOW_MS, SCAN_INTERVAL_MS,
-                KEEPALIVE_DUTY_PCT);
-}
 
 // ---------- UI ----------
 // This panel drives its pixels inverted: the code writes TFT_BLACK and the screen shows white.
@@ -323,9 +463,10 @@ int W,H,HDR,COLW,RH;
 enum View { LIVE, PLOT, EXPORT };
 View view=LIVE; int plotMetric=0; int plotBinMin=60;   // 60/30/15
 uint32_t g_exportStart=0;                              // millis() when export mode began
-String g_lastSig="~"; long g_lastAge=-999;             // live-view redraw state (global so we can force it)
+LiveRenderKey g_lastRenderKey;
+bool g_renderKeyValid = false;
 
-void cell(int col,int r,const char* label,const String& val,const char* unit,uint16_t color){
+void cell(int col,int r,const char* label,const char* val,const char* unit,uint16_t color){
   int x=col*COLW,y=HDR+r*RH;
   tft.setTextDatum(textdatum_t::top_left); tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(GREY);
   tft.drawString(label,x+8,y+2);
@@ -333,17 +474,29 @@ void cell(int col,int r,const char* label,const String& val,const char* unit,uin
   tft.setFont(&fonts::Font7); tft.setTextSize(1); tft.setTextColor(color);
   tft.setTextDatum(textdatum_t::top_left); tft.drawString(val,x+8,y+20);
 }
-void drawHeader(bool stale,int sig,int rssi,long ageS){
+void drawHeader(const ReadingSnapshot& reading,RadioState radioState,bool stale){
   tft.fillRect(0,2,W,HDR-4,BG);
   tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextDatum(textdatum_t::top_left);
   tft.setTextColor(GREY); tft.drawString("Oliwia",6,4);
-  if(g_skinValid && !stale){ char sb[10]; snprintf(sb,10,"%.1fC",g_skin);   // skin temp small, by the name
+  if(reading.skinValid && !stale){ char sb[10]; snprintf(sb,10,"%.1fC",reading.skinC);   // skin temp small, by the name
     tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(0xFE79); tft.setTextDatum(textdatum_t::top_left);
     tft.drawString(sb,74,5); }
-  char hm[8]; bool haveT=nowHM(hm);
+  char hm[8]; bool haveTime=nowHM(hm);
   tft.setFont(&fonts::FreeSans9pt7b); tft.setTextDatum(textdatum_t::top_right); char buf[40];
-  if(stale){tft.setTextColor(0xEB44); snprintf(buf,40,"%s %s",haveT?hm:"",g_lastMs?"NO SIGNAL":"scan");}
-  else {tft.setTextColor(GREY); snprintf(buf,40,"%s  sig%d",haveT?hm:"",sig);}
+  if(radioState == RadioState::RECEIVING){
+    tft.setTextColor(GREY);
+    snprintf(buf,sizeof(buf),"%s%s%s%d",
+             haveTime?hm:"",haveTime?"  ":"","sig",reading.signal);
+  } else {
+    tft.setTextColor(0xEB44);
+    const char* status = radioState == RadioState::STARTING
+                             ? "scan"
+                             : (radioState == RadioState::BAND_MISSING
+                                    ? "BAND / RANGE"
+                                    : "RADIO RETRY");
+    snprintf(buf,sizeof(buf),"%s%s%s",
+             haveTime?hm:"",haveTime?"  ":"",status);
+  }
   tft.drawString(buf,W-6,5);
 }
 // mini 1-hour sparkline with warning reference lines
@@ -366,28 +519,41 @@ void miniPlot(int x,int y,int w,int h,bool isHR){
       if(px>=0) tft.drawLine(px,py,xx,yy,col); px=xx; py=yy; }
   }
 }
-void drawLive(bool stale,int hr,int spo2,float skin,bool tempOK,int sig,int rssi,long ageS,const String& alert){
+void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,uint8_t alertMask){
   bool d=stale; tft.fillScreen(BG); tft.drawFastHLine(0,HDR-2,W,LINE);
-  drawHeader(stale,sig,rssi,ageS);
+  drawHeader(reading,radioState,stale);
+  char heartText[8];
+  char oxygenText[8];
+  if(stale || reading.heartRate == 0) strlcpy(heartText,"--",sizeof(heartText));
+  else snprintf(heartText,sizeof(heartText),"%d",reading.heartRate);
+  if(stale || reading.oxygenSaturation == 0) strlcpy(oxygenText,"--",sizeof(oxygenText));
+  else snprintf(oxygenText,sizeof(oxygenText),"%d",reading.oxygenSaturation);
   // top row: big current values
-  cell(0,0,"HEART", (d||!hr)?"--":String(hr),   "bpm", d?DIM:((hr<HR_LOW||hr>HR_HIGH)?TFT_RED:0x6E6C));
-  cell(1,0,"OXYGEN",(d||!spo2)?"--":String(spo2),"%",   d?DIM:((spo2&&spo2<SPO2_LOW)?TFT_RED:0x74FF));
+  cell(0,0,"HEART",heartText,"bpm",d?DIM:((reading.heartRate<HR_LOW||reading.heartRate>HR_HIGH)?TFT_RED:0x6E6C));
+  cell(1,0,"OXYGEN",oxygenText,"%",d?DIM:((reading.oxygenSaturation&&reading.oxygenSaturation<SPO2_LOW)?TFT_RED:0x74FF));
   // bottom row: 1-hour sparklines
   int py=HDR+RH;
   miniPlot(2,      py+2, COLW-3, RH-4, true);   // BPM
   miniPlot(COLW+1, py+2, COLW-3, RH-4, false);  // SpO2
-  if(alert.length()){ int by=H-20; tft.fillRect(0,by,W,20,TFT_RED);
+  char alertText[48] = "ALERT:";
+  if(alertMask & ALERT_HR_LOW) strlcat(alertText," HR LOW",sizeof(alertText));
+  if(alertMask & ALERT_HR_HIGH) strlcat(alertText," HR HIGH",sizeof(alertText));
+  if(alertMask & ALERT_SPO2_LOW) strlcat(alertText," SpO2 LOW",sizeof(alertText));
+  if(alertMask != ALERT_NONE){ int by=H-20; tft.fillRect(0,by,W,20,TFT_RED);
     tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE);
-    tft.setTextDatum(textdatum_t::middle_center); tft.drawString("ALERT:"+alert,W/2,by+10); }
+    tft.setTextDatum(textdatum_t::middle_center); tft.drawString(alertText,W/2,by+10); }
 }
-void renderLive(){
-  uint32_t age=millis()-g_lastMs; bool stale=(g_lastMs==0)||(age>STALE_MS);
-  int hr=g_hr,spo2=g_spo2,sig=g_sig,rssi=g_rssi; float skin=g_skin; bool tempOK=g_skinValid;
-  long ageS=stale?-1:(long)(age/1000); String alert="";
-  if(!stale){ if(hr&&hr<HR_LOW)alert+=" HR LOW"; if(hr>HR_HIGH)alert+=" HR HIGH"; if(spo2&&spo2<SPO2_LOW)alert+=" SpO2 LOW"; }
-  String s=String(stale)+","+hr+","+spo2+","+String(skin,1)+","+g_seq+","+alert;  // g_seq -> refresh sparklines each reading
-  if(s!=g_lastSig){ drawLive(stale,hr,spo2,skin,tempOK,sig,rssi,ageS,alert); g_lastSig=s; g_lastAge=ageS; }
-  else if(ageS!=g_lastAge){ drawHeader(stale,sig,rssi,ageS); g_lastAge=ageS; }
+void renderLive(const ReadingSnapshot& reading,RadioState radioState){
+  uint32_t ageMs=static_cast<uint32_t>(millis()-reading.lastPacketMs);
+  bool stale=reading.lastPacketMs==0 || ageMs>STALE_MS;
+  uint8_t alertMask=makeAlertMask(reading.heartRate,reading.oxygenSaturation,
+                                  stale,HR_LOW,HR_HIGH,SPO2_LOW);
+  LiveRenderKey key=makeLiveRenderKey(reading,radioState,stale,alertMask,minuteOfDay());
+  if(!g_renderKeyValid || key!=g_lastRenderKey){
+    drawLive(reading,radioState,stale,alertMask);
+    g_lastRenderKey=key;
+    g_renderKeyValid=true;
+  }
 }
 
 // ---------- 24h plot ----------
@@ -436,7 +602,7 @@ void applyTheme(){
   if(n==cur) return; cur=n;
   BG=n?INV(BG_D):BG_D;      GREY=n?INV(GREY_D):GREY_D;  DIM=n?INV(DIM_D):DIM_D;
   LINE=n?INV(LINE_D):LINE_D; GRID=n?INV(GRID_D):GRID_D;
-  g_lastSig="~";                                 // invalidate the live-view redraw cache
+  g_renderKeyValid=false;                         // invalidate the live-view redraw cache
   tft.fillScreen(BG);
   if(view==PLOT) drawPlot();
 }
@@ -587,30 +753,33 @@ void setup(){
   for(int r=0;r<4;r++){ tft.setRotation(r); tft.fillScreen(BG); }
   tft.setRotation(ROTATION); tft.setBrightness(BRIGHT_DAY);   // daytime level until the clock is known
   W=tft.width(); H=tft.height(); HDR=28; COLW=W/2; RH=(H-HDR)/2;
-  setenv("TZ","CET-1CEST,M3.5.0,M10.5.0/3",1); tzset();   // re-apply TZ each boot (survives via env, not the reboot)
+  setenv("TZ",TZ_INFO,1); tzset();   // re-apply TZ each boot (survives via env, not the reboot)
   bootMsg("SD card..."); initSD();
   // Clock: WiFi coexistence badly throttles BLE, and a deinit can't fully undo it. So on a COLD
   // boot we sync NTP once, then SOFT-REBOOT into BLE-only mode (the RTC clock survives the
   // reboot). On the second boot the time is already set, WiFi is skipped, and BLE runs full speed.
-  struct tm tmc; bool haveTime = getLocalTime(&tmc) && tmc.tm_year>120;
+  struct tm tmc{};
+  bool haveTime = readLocalClock(tmc);
   if (!haveTime && !g_syncedThisPower) {
-    g_syncedThisPower = true;                       // survives the soft reboot (RTC memory)
-    bootMsg("WiFi clock sync (one-time)..."); syncTimeOverWifi();
-    if (getLocalTime(&tmc) && tmc.tm_year>120) { bootMsg("clock set - rebooting for BLE..."); delay(250); ESP.restart(); }
+    bootMsg("WiFi clock sync (one-time)...");
+    bool synced = syncTimeOverWifi();
+    if (synced && readLocalClock(tmc)) {
+      g_syncedThisPower = true;                     // survives the soft reboot (RTC memory)
+      bootMsg("clock set - rebooting for BLE...");
+      delay(250);
+      ESP.restart();
+    }
   }
-  g_timeReady = getLocalTime(&tmc) && tmc.tm_year>120;
+  g_timeReady = readLocalClock(tmc);
   logBoot();                                      // evidence for tomorrow morning: why did it restart?
   applyBrightness(); applyTheme();
   bootMsg("Loading history..."); loadCsvToday();
   bootMsg("Bluetooth...");
-  BLEDevice::init(""); BLEScan* scan=BLEDevice::getScan(); g_bleScan=scan;
-  scan->setAdvertisedDeviceCallbacks(new CB(),true);
+  BLEDevice::init(""); g_bleScanner=BLEDevice::getScan();
+  g_bleScanner->setAdvertisedDeviceCallbacks(new CB(),true);
   // Passive: never transmit a scan request. Required by the receive-only rule at the top of this
   // file, and it also saves the TX bursts. Everything we decode is in the advertisement itself.
-  scan->setActiveScan(false);
-  scan->setInterval(SCAN_INTERVAL_MS); scan->setWindow(SCAN_WINDOW_MS);
-  scan->start(0,nullptr,false);
-  applyScanDuty();                                // go straight to night duty if we booted after dark
+  startBleScan(millis());
   tft.fillScreen(BG);
   Serial.printf("[ready] sd=%d time=%d\n",g_sdReady,g_timeReady);
 }
@@ -641,25 +810,23 @@ void loop(){
     }
   }
   // auto-return to the live view after 10 s of no touch in the plot
-  if(view==PLOT && millis()-lastTouch>10000){ view=LIVE; g_lastSig="~"; tft.fillScreen(BG); }
-  if(view==LIVE) renderLive();
+  if(view==PLOT && millis()-lastTouch>10000){ view=LIVE; g_renderKeyValid=false; tft.fillScreen(BG); }
+  RadioState radioState = serviceRadioRecovery(millis());
+  ReadingSnapshot reading = readSnapshot();
+  if(view==LIVE) renderLive(reading,radioState);
 
   // day/night backlight, checked every 10 s (no-op unless the level actually changes)
   static uint32_t lastBl=0;
-  if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); applyTheme(); applyScanDuty(); }
-
-  // Stop the power bank cutting out on the dim night load. Skipped mid-gesture: the load slice
-  // blocks for ~120 ms, which is too coarse to track a swipe, and someone touching the screen at
-  // 3 a.m. wants the UI responsive far more than they want the next slice of current.
-  if(!g_touching) keepAlive();
+  if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); applyTheme(); }
 
   // log + bin new readings
   static int lastLogged=-1;
-  if(g_seq!=lastLogged && g_lastMs && (millis()-g_lastMs)<3000){
-    lastLogged=g_seq;
-    logRow(g_hr,g_spo2,g_skin,g_skinValid);
-    int mod=minuteOfDay(); if(mod>=0) addReading(g_hr,g_spo2,mod);
-    pushHist(g_hr,g_spo2);                       // feed the 1-hour sparklines
+  if(reading.sequence!=lastLogged && reading.lastPacketMs != 0 &&
+     static_cast<uint32_t>(millis()-reading.lastPacketMs)<3000){
+    lastLogged=reading.sequence;
+    logRow(reading.heartRate,reading.oxygenSaturation,reading.skinC,reading.skinValid);
+    int mod=minuteOfDay(); if(mod>=0) addReading(reading.heartRate,reading.oxygenSaturation,mod);
+    pushHist(reading.heartRate,reading.oxygenSaturation);  // feed the 1-hour sparklines
   }
   delay(g_touching?15:60);                       // sample faster mid-gesture so swipes track well
 }
