@@ -181,6 +181,8 @@ above it are the radio and the backlight.
 | `SCAN_INTERVAL_MS 1000` / `SCAN_WINDOW_MS 500` | Receiving costs ~90–100 mA and the old 99 %-duty scan dominated the budget for no benefit — the wristband advertises every ~1.5 s and only produces a new heart rate every ~20 s. 50 % is as low as this board goes reliably; see the measurements below. |
 | `BRIGHT_DAY 140` | Backlight current tracks the PWM duty closely, so this is about half the power of full brightness and still easily readable indoors. |
 | `BRIGHT_NIGHT 1` | Lowest non-zero step. `0` switches the backlight off entirely. |
+| `KEEPALIVE_DUTY_PCT 60` | Deliberately *wastes* current so a power bank keeps seeing a load. Runs around the clock. See the power-bank note below. |
+| `SCAN_WINDOW_NIGHT_MS` | At night the radio goes to 100 % duty (window = interval). Partly to draw current, partly because a sleeping baby is when dropouts matter most. |
 
 **Don't lower `SCAN_WINDOW_MS` without re-measuring.** Reception degrades much faster than the duty
 ratio suggests, because rendering and SD writes compete with the radio. Worst gap between decoded
@@ -192,12 +194,32 @@ advertisements, measured on this board with the full firmware running, over ~3 m
 | 500 / 1000 | 50 % | ~29 | **2.0 s** | comfortable — shipped |
 | 300 / 1000 | 30 % | ~15 | **13.0 s** | too close to `STALE_MS`, drops to `--` |
 
-> **Powering it from a USB power bank?** The original firmware got **about 2 days from a 10 000 mAh
-> bank** — that rating is at the 3.7 V cell, so after the boost to 5 V you actually get
-> ~6 000–6 500 mAh. The settings above should stretch that to roughly 3–3.5 days. Two more things to
-> know. Some banks cut power when the draw stays under ~50–100 mA, which the dimmed night load can
-> trigger; if yours switches itself off overnight, raise `BRIGHT_NIGHT` a few steps. And a mains USB
-> charger has no low-load cutoff and no runtime limit, so it sidesteps both problems.
+> **Powering it from a USB power bank?** Many banks cut their output when the draw stays under
+> ~50–100 mA, and they judge that on the **average** current over a multi-second window, not on
+> peaks. Dimming the backlight at night pushes this board under that line, and the bank switches
+> itself off — observed here roughly an hour after the night window opened.
+>
+> The fix is `KEEPALIVE_DUTY_PCT`: the firmware holds a deliberate load — a CPU spin plus read-only
+> reads of today's CSV — for that percentage of every 200 ms slice, around the clock. Both loads are
+> silent and dark, so the room stays dark. A first attempt used a 120 ms burst every 8 s and **did
+> not work**: 1.5 % duty moves the average by well under 1 mA. Short spikes are not enough; only a
+> genuinely higher sustained average is.
+>
+> If the bank still cuts out, raise `KEEPALIVE_DUTY_PCT`. Once it survives a night, step it back
+> down (60 → 45 → 30) to find the margin. Raising `BRIGHT_NIGHT` also works and is the bigger lever,
+> but it lights up the room, which is the thing night mode exists to prevent.
+>
+> **This trades runtime for reliability, on purpose.** The original firmware got about 2 days from a
+> 10 000 mAh bank — that rating is at the 3.7 V cell, so after the boost to 5 V you actually get
+> ~6 000–6 500 mAh. Burning current to stay alive gives that back up; expect roughly 1.5–2 days
+> rather than the 3–3.5 the efficiency settings alone would allow. A mains USB charger has no
+> low-load cutoff and no runtime limit, so it sidesteps the whole problem — and if the board is
+> permanently by a cot, that is the better supply.
+>
+> **`/boot.log` on the SD card** records why each restart happened, so you can tell these apart
+> without a current meter: `POWERON` means the supply was cut and came back (bank cutoff — raise the
+> duty), `BROWNOUT` means the 5 V rail sagged (cable or current limit — more load makes it *worse*),
+> and `PANIC`/`TASK_WDT` mean the firmware crashed, which no keep-alive setting will fix.
 
 ### Getting the data off the board
 

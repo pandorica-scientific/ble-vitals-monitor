@@ -26,6 +26,7 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_system.h>    // esp_reset_reason() - see logBoot()
 #include <WebServer.h>
 #include <time.h>
 #include <math.h>
@@ -56,6 +57,31 @@
 // Re-measure the worst gap against STALE_MS before lowering the window.
 #define SCAN_INTERVAL_MS 1000     // how often a scan window starts
 #define SCAN_WINDOW_MS   500      // how long the radio listens inside that window
+// ---- power-bank keep-alive (v2) ----
+// Most USB power banks cut their output when the load stays under ~50-100 mA, and they judge that
+// on the AVERAGE current over a multi-second window, not on peaks.
+// v1 tried a 120 ms burst every 8 s. That is 1.5% duty: even a generous +50 mA burst lifts the
+// average by ~0.75 mA, so the bank never noticed and still cut out overnight. Peaks do not work;
+// only a genuinely higher sustained average does.
+// v2 therefore holds an artificial load for a large fraction of every slice, around the clock.
+// Both loads are silent and invisible - no backlight flash, so the room stays dark at night:
+//   - a CPU spin, which also stops loop()'s delay() parking the core in its low-power idle
+//   - repeated 512 B reads of today's CSV. READ-only, so it costs no write wear on the card.
+// The load runs in short slices rather than one long block so touch stays responsive.
+// Cost: this deliberately burns current, so a bank that is NOT on mains pass-through will run flat
+// sooner. Rough order of magnitude on a 10 Ah bank, ~6 Ah usable at 5 V: several days either way,
+// so the trade is worth it - but if you ever run this off a charge rather than a socket, expect it.
+#define KEEPALIVE_DUTY_PCT  60    // percent of each slice spent under load. 0 = off.
+                                  // Start high: another failed night costs a whole night of data.
+                                  // Once it survives, step down 60 -> 45 -> 30 to find the margin.
+#define KEEPALIVE_SLICE_MS  200   // load/idle slice. 60% -> 120 ms load, 80 ms normal loop work.
+#define KEEPALIVE_NIGHT_ONLY 0    // 0 = run around the clock. The daytime backlight probably carries
+                                  // the load on its own, but "probably" is not worth a missed night:
+                                  // a bank that cuts out at noon loses just as much data.
+// At night the BLE radio also goes to 100% duty: interval == window. Receiving is one of the few
+// big silent loads available, and it doubles as better overnight capture - fewer "--" dropouts at
+// exactly the hours the monitor matters most. Costs ~40 mA, which is the point.
+#define SCAN_WINDOW_NIGHT_MS SCAN_INTERVAL_MS
 // ---- data export mode: swipe UP from the live view, swipe DOWN to resume ----
 // The board becomes its own WiFi access point and serves the logged CSVs to a phone, so the data
 // can be pulled anywhere (a doctor's office) with no home network, no hotspot and no SD removal.
@@ -109,6 +135,15 @@ volatile bool  g_skinValid=false;
 volatile uint32_t g_lastMs=0;
 bool g_timeReady=false, g_sdReady=false;
 RTC_DATA_ATTR bool g_syncedThisPower=false;   // survives the soft reboot below
+// The real reason this power cycle started, carried across the deliberate NTP soft-reboot below.
+// Without this every restart would be recorded as SW: the cold boot has no clock yet, so it cannot
+// write a timestamped line, and by the time boot 2 can, esp_reset_reason() only reports our own
+// ESP.restart(). RTC memory survives a SW reset but not a power cut, which is exactly the
+// distinction logBoot() needs.
+RTC_DATA_ATTR esp_reset_reason_t g_origReason=ESP_RST_UNKNOWN;
+// NOT g_scan: the ESP32 WiFi blob (libnet80211.a) exports a global of that exact name and the
+// link fails with a multiple-definition error. Same trap as the TX1 macro clash.
+BLEScan* g_bleScan=nullptr;                   // kept so the night duty cycle can be retuned live
 
 // ---------- rolling ~1-hour history for the mini sparklines (~180 readings @ ~20s) ----------
 #define HN 180
@@ -196,6 +231,30 @@ void loadCsvToday(){
   }
   f.close(); Serial.printf("[csv] loaded %d rows into bins (heldSkin=%.1f valid=%d)\n",n,g_skin,g_skinValid);
 }
+// Why the board restarted, appended to its own file so the CSV format the report app parses is
+// untouched. There is no current meter on this build, so this is the only evidence that separates
+// the three candidate causes of a dead screen in the morning:
+//   POWERON  - the supply was cut and came back    -> power bank idle-cutoff, keep-alive too weak
+//   BROWNOUT - the 5 V rail sagged                 -> cable/bank current limit, NOT an idle cutoff
+//   PANIC/WDT/TASK_WDT - firmware crashed          -> a bug, and no keep-alive setting will fix it
+// A single POWERON at the time you plugged it in is normal. Extra entries overnight are the bug.
+void logBoot(){
+  if(!g_sdReady || !g_timeReady) return;
+  const char* r; switch(g_origReason){
+    case ESP_RST_POWERON:  r="POWERON";  break;   case ESP_RST_BROWNOUT: r="BROWNOUT"; break;
+    case ESP_RST_SW:       r="SW";       break;   case ESP_RST_PANIC:    r="PANIC";    break;
+    case ESP_RST_INT_WDT:  r="INT_WDT";  break;   case ESP_RST_TASK_WDT: r="TASK_WDT"; break;
+    case ESP_RST_WDT:      r="WDT";      break;   case ESP_RST_DEEPSLEEP:r="DEEPSLEEP";break;
+    case ESP_RST_EXT:      r="EXT";      break;   // EN pin pulled low - i.e. a flash/serial reset
+    default:               r="OTHER";    break; }
+  // The numeric code goes in too: a bare "OTHER" at 03:00 is a dead end, and the enum has more
+  // members (USB, JTAG, CPU_LOCKUP, PWR_GLITCH) than are worth spelling out here.
+  File f=SD.open("/boot.log",FILE_APPEND); if(!f) return;
+  struct tm tm; char ts[24]="?";
+  if(getLocalTime(&tm)) strftime(ts,24,"%F %T",&tm);
+  f.printf("%s,%s,%d\n",ts,r,(int)g_origReason); f.close();
+  Serial.printf("[boot] %s reset=%s(%d)\n",ts,r,(int)g_origReason);
+}
 bool nowHM(char* o){ struct tm tm; if(!getLocalTime(&tm))return false; strftime(o,8,"%H:%M",&tm); return true; }
 int minuteOfDay(){ struct tm tm; if(!getLocalTime(&tm))return -1; return tm.tm_hour*60+tm.tm_min; }
 // 20:00 -> 08:00 is "night": dim backlight + dark theme.
@@ -211,6 +270,45 @@ void setBacklight(int want){                     // single owner of the PWM; onl
   static int cur=-1; if(want!=cur){ tft.setBrightness(want); cur=want; }
 }
 void applyBrightness(){ setBacklight(wantBrightness()); }
+
+// Hold a silent artificial load so the power bank keeps seeing a real device (see KEEPALIVE_* above).
+// Called once per loop(); each call either runs one load slice or returns immediately.
+void keepAlive(){
+  if(!KEEPALIVE_DUTY_PCT) return;
+  if(KEEPALIVE_NIGHT_ONLY && !isNight()) return;   // by day the backlight already draws plenty
+  static uint32_t last=0;
+  if(millis()-last < KEEPALIVE_SLICE_MS) return;   // idle part of the slice: let loop() do its work
+  last=millis();
+
+  // Read-only handle on today's log. Reopened per slice on purpose: the file the writer appends to
+  // changes at midnight, and a stale handle would pin the previous day's file open all night.
+  File f; if(g_sdReady && g_timeReady){ char fn[32]; csvName(fn); f=SD.open(fn); }
+  uint8_t buf[512]; volatile float spin=1.0f;
+  uint32_t on=(uint32_t)KEEPALIVE_SLICE_MS*KEEPALIVE_DUTY_PCT/100, t0=millis();
+  while(millis()-t0 < on){
+    if(f){ if(!f.available()) f.seek(0); f.read(buf,sizeof(buf)); }
+    for(int i=0;i<2000;i++) spin=spin*1.000001f+0.5f;
+  }
+  if(f) f.close();
+}
+
+// 100% BLE duty while dimmed, the measured 50% duty by day. Only touches the radio on an actual
+// day/night transition, i.e. twice a day.
+// The scan MUST be stopped and restarted: setWindow() only writes BLEScan::m_scan_params, and those
+// are pushed to the controller by esp_ble_gap_set_scan_params() inside start(). Calling setWindow()
+// on a running scan changes nothing at all - it fails silently, which is why this is worth a comment.
+void applyScanDuty(){
+  if(!g_bleScan) return;
+  static int cur=-1; int n=isNight()?1:0;
+  if(n==cur) return; cur=n;
+  g_bleScan->stop();
+  g_bleScan->setInterval(SCAN_INTERVAL_MS);
+  g_bleScan->setWindow(n?SCAN_WINDOW_NIGHT_MS:SCAN_WINDOW_MS);
+  g_bleScan->start(0,nullptr,false);
+  Serial.printf("[keepalive] %s: scan %d/%d ms, load duty=%d%%\n",
+                n?"night":"day", n?SCAN_WINDOW_NIGHT_MS:SCAN_WINDOW_MS, SCAN_INTERVAL_MS,
+                KEEPALIVE_DUTY_PCT);
+}
 
 // ---------- UI ----------
 // This panel drives its pixels inverted: the code writes TFT_BLACK and the screen shows white.
@@ -481,6 +579,8 @@ void bootMsg(const char* s){ tft.fillScreen(BG); tft.setFont(&fonts::FreeSans9pt
 
 void setup(){
   Serial.begin(115200); delay(300);
+  // Latch the true cause before the NTP soft-reboot can overwrite it with ESP_RST_SW (see g_origReason).
+  { esp_reset_reason_t rr=esp_reset_reason(); if(rr!=ESP_RST_SW) g_origReason=rr; }
   pinMode(T_CLK,OUTPUT); pinMode(T_MOSI,OUTPUT); pinMode(T_CS,OUTPUT);
   pinMode(T_MISO,INPUT); pinMode(T_IRQ,INPUT); digitalWrite(T_CS,HIGH); digitalWrite(T_CLK,LOW);
   tft.init();
@@ -499,16 +599,18 @@ void setup(){
     if (getLocalTime(&tmc) && tmc.tm_year>120) { bootMsg("clock set - rebooting for BLE..."); delay(250); ESP.restart(); }
   }
   g_timeReady = getLocalTime(&tmc) && tmc.tm_year>120;
+  logBoot();                                      // evidence for tomorrow morning: why did it restart?
   applyBrightness(); applyTheme();
   bootMsg("Loading history..."); loadCsvToday();
   bootMsg("Bluetooth...");
-  BLEDevice::init(""); BLEScan* scan=BLEDevice::getScan();
+  BLEDevice::init(""); BLEScan* scan=BLEDevice::getScan(); g_bleScan=scan;
   scan->setAdvertisedDeviceCallbacks(new CB(),true);
   // Passive: never transmit a scan request. Required by the receive-only rule at the top of this
   // file, and it also saves the TX bursts. Everything we decode is in the advertisement itself.
   scan->setActiveScan(false);
   scan->setInterval(SCAN_INTERVAL_MS); scan->setWindow(SCAN_WINDOW_MS);
   scan->start(0,nullptr,false);
+  applyScanDuty();                                // go straight to night duty if we booted after dark
   tft.fillScreen(BG);
   Serial.printf("[ready] sd=%d time=%d\n",g_sdReady,g_timeReady);
 }
@@ -544,7 +646,12 @@ void loop(){
 
   // day/night backlight, checked every 10 s (no-op unless the level actually changes)
   static uint32_t lastBl=0;
-  if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); applyTheme(); }
+  if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); applyTheme(); applyScanDuty(); }
+
+  // Stop the power bank cutting out on the dim night load. Skipped mid-gesture: the load slice
+  // blocks for ~120 ms, which is too coarse to track a swipe, and someone touching the screen at
+  // 3 a.m. wants the UI responsive far more than they want the next slice of current.
+  if(!g_touching) keepAlive();
 
   // log + bin new readings
   static int lastLogged=-1;
