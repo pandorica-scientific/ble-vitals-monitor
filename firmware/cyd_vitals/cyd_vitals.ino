@@ -34,6 +34,11 @@
 #include "live_render_key.h"
 #include "radio_health.h"
 #include "wifi_failover.h"
+#include "critical_alarm.h"
+#include "trace_window.h"
+#include "hold_gesture.h"
+#include "alert_log.h"
+#include "contacts.h"
 #include "app_html.h"      // the report page served in export mode (PROGMEM)
 
 #define ROTATION 0
@@ -41,6 +46,26 @@
 #define HR_HIGH 180
 #define SPO2_LOW 90
 #define STALE_MS 30000
+// ---- critical tachycardia alarm ----
+// Sized against a ten-minute decision window: a sustained rate at or above HR_CRIT means a
+// hospital visit within roughly ten minutes, so a one-minute confirmation costs 10% of it.
+// HR_CANCEL deliberately equals HR_HIGH so the three levels read as one coherent scale.
+#define HR_CRIT             200   // bpm at or above which the alarm arms
+#define HR_SUSTAIN          190   // the last reading of the window must be at or above this
+#define HR_CANCEL           180   // a reading below this abandons the window
+#define HR_COLLAPSE_FROM    170   // previous reading at or above this...
+#define HR_COLLAPSE_TO       60   // ...and this one at or below it escalates at once
+#define HR_RAIL             255   // the uint8_t ceiling; shown as ">=255"
+#define CRIT_MIN_HIGH         2   // readings at or above HR_CRIT needed in one window
+#define CRIT_CONFIRM_MS   60000   // confirmation window length
+#define ALARM_SNOOZE_MS  600000   // suppression after a dismissal, so the board can be carried
+#define ALARM_FLASH_MS      500   // half-period of the perimeter flash
+#define HOLD_COUNTDOWN_MS  3000   // hold duration for dismissal and self-test alike
+// 60 s, not 10: the heart rate updates roughly every 20 seconds, so a ten-second test never shows
+// the trace move and cannot demonstrate that it is live. A minute spans about three readings.
+// A three-second hold ends it early, so it never traps the screen.
+#define SELFTEST_DURATION_S  60   // how long the test alarm runs before returning by itself
+#define SPO2_STALE_MIN       20   // minutes after which the oxygen reading is greyed
 // backlight: dim overnight so the display doesn't light up the room
 #define NIGHT_START_MIN (20*60)   // 20:00 -> dim
 #define NIGHT_END_MIN   (8*60)    // 08:00 -> full
@@ -251,11 +276,27 @@ RTC_DATA_ATTR bool g_syncedThisPower=false;   // survives the soft reboot below
 // ESP.restart(). RTC memory survives a SW reset but not a power cut, which is exactly the
 // distinction logBoot() needs.
 RTC_DATA_ATTR esp_reset_reason_t g_origReason=ESP_RST_UNKNOWN;
+// The alarm latch must outlive a watchdog reset, a panic and the NTP soft reboot, so it lives in
+// RTC memory alongside g_origReason. RTC memory does NOT survive a power cut, which is why the
+// onset is also written to /alerts.csv the moment it happens and reconciled at boot.
+RTC_DATA_ATTR AlarmMachine g_alarm;
+const AlarmConfig ALARM_CFG{HR_CRIT,HR_SUSTAIN,HR_CANCEL,HR_COLLAPSE_FROM,HR_COLLAPSE_TO,
+                            CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS};
+Contacts g_contacts;
+HoldState g_hold;
+int g_alarmKey=0; bool g_alarmKeyValid=false;
+bool g_selfTest=false; uint32_t g_selfTestStart=0;
+uint32_t g_spo2StampEpoch=0;
 // ---------- rolling ~1-hour history for the mini sparklines (~180 readings @ ~20s) ----------
+// histEpoch gives the trace a real time axis. Without it a four-minute dropout draws as a
+// straight line between two adjacent samples, which reads as a steady rate for four minutes -
+// the opposite of what happened. 720 bytes buys the difference between "we don't know" and a
+// confident lie, and the alarm trace is read precisely when dropouts are most likely.
 #define HN 180
-uint8_t hrHist[HN], spHist[HN]; int histHead=0, histCnt=0;
-void pushHist(int hr,int sp){
+uint8_t hrHist[HN], spHist[HN]; uint32_t histEpoch[HN]; int histHead=0, histCnt=0;
+void pushHist(int hr,int sp,uint32_t epoch){
   hrHist[histHead]=constrain(hr,0,254); spHist[histHead]=constrain(sp,0,254);
+  histEpoch[histHead]=epoch;
   histHead=(histHead+1)%HN; if(histCnt<HN) histCnt++;
 }
 
@@ -381,6 +422,18 @@ bool syncTimeOverWifi() {
 // disagree about which file "today" is.
 void csvName(char* out,const struct tm* tm){ strftime(out,32,"/vitals_%Y-%m-%d.csv",tm); }
 void csvName(char* out){ struct tm tm{}; if(readLocalClock(tm)) csvName(out,&tm); else out[0]='\0'; }
+// 0 means "no usable timestamp" - the trace falls back to a positional axis and says so, rather
+// than placing samples at epoch zero and drawing a confident wrong time axis.
+uint32_t nowEpochOrZero(){ struct tm tm{}; if(!readLocalClock(tm)) return 0; return (uint32_t)mktime(&tm); }
+// Rows in today's CSV carry a full timestamp; combine it with today's date so reloaded history
+// lands on the same axis as live readings. Seconds matter: readings arrive about every 22 s, so
+// quantising to the minute would stack two or three of them on one x-position and turn a real
+// dropout into an apparent one.
+uint32_t csvRowEpoch(int hh,int mm,int ss){
+  struct tm tm{}; if(!readLocalClock(tm)) return 0;
+  tm.tm_hour=hh; tm.tm_min=mm; tm.tm_sec=ss;
+  return (uint32_t)mktime(&tm);
+}
 void logRow(int hr,int spo2,float skin,bool sv){
   if(!g_sdReady||!g_timeReady) return; struct tm tm{}; if(!readLocalClock(tm)) return;
   char fn[32]; csvName(fn,&tm); bool isNew=!SD.exists(fn);
@@ -390,18 +443,60 @@ void logRow(int hr,int spo2,float skin,bool sv){
   if(sv) f.printf("%s,%d,%d,%.1f\n",ts,hr,spo2,skin); else f.printf("%s,%d,%d,\n",ts,hr,spo2);
   f.close();
 }
+// /alerts.csv is append-only. Rewriting a row in place on an SD card is not crash-safe; appending
+// events is, so a brownout mid-episode still leaves a readable file and an open episode.
+void logAlert(const char* event,int hr,int spo2,const char* detail){
+  if(!g_sdReady) return; struct tm tm{}; if(!readLocalClock(tm)) return;
+  char ts[24]; strftime(ts,sizeof(ts),"%F %T",&tm);
+  bool isNew=!SD.exists("/alerts.csv");
+  File f=SD.open("/alerts.csv",FILE_APPEND); if(!f) return;
+  if(isNew) f.println("timestamp,event,hr_bpm,spo2_pct,detail");
+  char row[128]; formatAlertRow(row,sizeof(row),ts,event,hr,spo2,detail);
+  f.println(row); f.close();
+}
+
+// The repository ships no /contacts.txt and contains no real numbers: this project is published
+// for other people to build, and compiling one family's hospital numbers into it would put those
+// numbers on a stranger's screen during their emergency.
+void loadContacts(){
+  g_contacts=Contacts{};
+  if(!g_sdReady) return;
+  File f=SD.open("/contacts.txt",FILE_READ); if(!f) return;
+  char buf[128]; size_t n=f.readBytes(buf,sizeof(buf)-1); buf[n]='\0'; f.close();
+  parseContacts(buf,g_contacts);
+}
+
+// An ONSET with no later DISMISS means the board died mid-episode. Coming back up silent would be
+// the worst possible behaviour, so the alarm is re-entered.
+void reconcileOpenEpisode(){
+  if(!g_sdReady||!g_timeReady) return;
+  File f=SD.open("/alerts.csv",FILE_READ); if(!f) return;
+  OpenEpisode open{};
+  while(f.available()){
+    String ln=f.readStringUntil('\n'); if(ln.length()<20) continue;
+    struct tm tm{}; if(strptime(ln.c_str(),"%Y-%m-%d %H:%M:%S",&tm)==nullptr) continue;
+    reconcileAlertLine(ln.c_str(),(uint32_t)mktime(&tm),open);
+  }
+  f.close();
+  if(open.open && g_alarm.state!=AlarmState::ALARM){
+    g_alarm.state=AlarmState::ALARM; g_alarm.cause=AlarmCause::CONFIRMED_HIGH;
+    g_alarm.onsetEpoch=open.onsetEpoch; g_alarm.resolved=false;
+    logAlert("BOOT_RESUME",0,0,"recovered from card");
+  }
+}
+
 void loadCsvToday(){
   if(!g_sdReady||!g_timeReady) return; char fn[32]; csvName(fn);
   File f=SD.open(fn); if(!f){Serial.println("[csv] no file to load");return;}
   f.readStringUntil('\n'); int n=0;
   while(f.available()){
     String ln=f.readStringUntil('\n'); if(ln.length()<19) continue;
-    int hh=ln.substring(11,13).toInt(), mm=ln.substring(14,16).toInt();
+    int hh=ln.substring(11,13).toInt(), mm=ln.substring(14,16).toInt(), ss=ln.substring(17,19).toInt();
     int c1=ln.indexOf(','); int c2=ln.indexOf(',',c1+1); int c3=ln.indexOf(',',c2+1);
     if(c1<0||c2<0) continue;
     int hr=ln.substring(c1+1,c2).toInt();
     int sp=ln.substring(c2+1,c3<0?ln.length():c3).toInt();
-    addReading(hr,sp,hh*60+mm); pushHist(hr,sp); n++;   // last HN kept -> ~1h sparkline survives reboot
+    addReading(hr,sp,hh*60+mm); pushHist(hr,sp,csvRowEpoch(hh,mm,ss)); n++;   // last HN kept -> ~1h sparkline survives reboot
     // remember the last valid skin temp so the display holds it (like the app) instead of "--"
     if(c3>=0){ String sf=ln.substring(c3+1); sf.trim();
       if(sf.length()){ float sk=sf.toFloat(); if(sk>=BAND_SKIN_MIN_C&&sk<=BAND_SKIN_MAX_C){ holdSkinTemperature(sk); } } }
@@ -460,14 +555,20 @@ void applyBrightness(){ setBacklight(wantBrightness()); }
 const uint16_t GREY_D=0x9CD3, DIM_D=0x52AA, LINE_D=0x2965, GRID_D=0x1082, BG_D=TFT_BLACK;
 uint16_t GREY=GREY_D, DIM=DIM_D, LINE=LINE_D, GRID=GRID_D, BG=BG_D;
 int W,H,HDR,COLW,RH;
-enum View { LIVE, PLOT, EXPORT };
+enum View { LIVE, PLOT, EXPORT, ALARM };
 View view=LIVE; int plotMetric=0; int plotBinMin=60;   // 60/30/15
+
+// Included here, not with the other headers at the top: it draws, so it needs tft, W, H, DIM and
+// the history buffer to already exist. Kept out of this file so the sketch does not absorb two
+// hundred lines of layout code.
+#include "alarm_render.h"
 uint32_t g_exportStart=0;                              // millis() when export mode began
 LiveRenderKey g_lastRenderKey;
 bool g_renderKeyValid = false;
 
 void cell(int col,int r,const char* label,const char* val,const char* unit,uint16_t color){
   int x=col*COLW,y=HDR+r*RH;
+  tft.fillRect(x,y,COLW,RH,BG);        // clear our own area, so the live view never full-screen wipes
   tft.setTextDatum(textdatum_t::top_left); tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(GREY);
   tft.drawString(label,x+8,y+2);
   tft.setTextDatum(textdatum_t::bottom_right); tft.drawString(unit,x+COLW-8,y+RH-4);
@@ -505,8 +606,13 @@ void miniPlot(int x,int y,int w,int h,bool isHR){
   float ymin=isHR?50:80, ymax=isHR?250:100;        // BPM clips 50..250 ; SpO2 80..100
   float refYel=isHR?160:92, refRed=isHR?200:90;    // yellow/red warning lines
   uint16_t col=isHR?0x6E6C:0x74FF;
+  tft.fillRect(x,y,w,h,BG);            // clear our own area, so the live view never full-screen wipes
   tft.drawRect(x,y,w,h,LINE);
-  auto Y=[&](float v){ v=constrain(v,ymin,ymax); return y+h-2-(int)((v-ymin)/(ymax-ymin)*(h-3)); };
+  // TOP_PAD reserves a strip for the label. Without it a reading at the top of the scale (SpO2 100,
+  // HR 250) plots one pixel above the text and sits on top of "SpO2 1h".
+  const int TOP_PAD=11;
+  auto Y=[&](float v){ v=constrain(v,ymin,ymax);
+                       return y+h-2-(int)((v-ymin)/(ymax-ymin)*(h-3-TOP_PAD)); };
   // NOTE: this panel renders TFT_YELLOW/TFT_RED swapped, so the constants are crossed on purpose:
   tft.drawFastHLine(x+1,Y(refYel),w-2,TFT_RED);      // caution line -> shows YELLOW
   tft.drawFastHLine(x+1,Y(refRed),w-2,TFT_YELLOW);   // danger line  -> shows RED
@@ -519,9 +625,24 @@ void miniPlot(int x,int y,int w,int h,bool isHR){
       if(px>=0) tft.drawLine(px,py,xx,yy,col); px=xx; py=yy; }
   }
 }
-void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,uint8_t alertMask){
-  bool d=stale; tft.fillScreen(BG); tft.drawFastHLine(0,HDR-2,W,LINE);
-  drawHeader(reading,radioState,stale);
+// Repaints only the regions whose values actually changed.
+//
+// This used to fillScreen() and redraw everything whenever the render key changed - which is on
+// every new measurement, about every 22 s (measured: 32 logged rows in 12 minutes). Wiping the
+// whole panel to change two numbers reads as a blink. Each region now clears its own rectangle
+// instead, and the full wipe happens only on a genuine full redraw: theme change, or returning
+// from another view.
+void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,uint8_t alertMask,
+              const LiveRenderKey& key,const LiveRenderKey& prev,bool full){
+  bool d=stale;
+  if(full){ tft.fillScreen(BG); tft.drawFastHLine(0,HDR-2,W,LINE); }
+
+  if(full || key.minuteKey!=prev.minuteKey || key.signal!=prev.signal ||
+     key.radioState!=prev.radioState || key.stale!=prev.stale ||
+     key.skinTenths!=prev.skinTenths || key.skinValid!=prev.skinValid){
+    drawHeader(reading,radioState,stale);       // already clears its own strip
+  }
+
   char heartText[8];
   char oxygenText[8];
   if(stale || reading.heartRate == 0) strlcpy(heartText,"--",sizeof(heartText));
@@ -529,12 +650,17 @@ void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,ui
   if(stale || reading.oxygenSaturation == 0) strlcpy(oxygenText,"--",sizeof(oxygenText));
   else snprintf(oxygenText,sizeof(oxygenText),"%d",reading.oxygenSaturation);
   // top row: big current values
-  cell(0,0,"HEART",heartText,"bpm",d?DIM:((reading.heartRate<HR_LOW||reading.heartRate>HR_HIGH)?TFT_RED:0x6E6C));
-  cell(1,0,"OXYGEN",oxygenText,"%",d?DIM:((reading.oxygenSaturation&&reading.oxygenSaturation<SPO2_LOW)?TFT_RED:0x74FF));
-  // bottom row: 1-hour sparklines
+  if(full || key.heartRate!=prev.heartRate || key.stale!=prev.stale)
+    cell(0,0,"HEART",heartText,"bpm",d?DIM:((reading.heartRate<HR_LOW||reading.heartRate>HR_HIGH)?TFT_RED:0x6E6C));
+  if(full || key.oxygenSaturation!=prev.oxygenSaturation || key.stale!=prev.stale)
+    cell(1,0,"OXYGEN",oxygenText,"%",d?DIM:((reading.oxygenSaturation&&reading.oxygenSaturation<SPO2_LOW)?TFT_RED:0x74FF));
+  // bottom row: 1-hour sparklines. Redrawn when the alert bar appears or clears too, because the
+  // bar overlaps their bottom rows and leaves a hole behind it otherwise.
   int py=HDR+RH;
-  miniPlot(2,      py+2, COLW-3, RH-4, true);   // BPM
-  miniPlot(COLW+1, py+2, COLW-3, RH-4, false);  // SpO2
+  if(full || key.sequence!=prev.sequence || key.alertMask!=prev.alertMask){
+    miniPlot(2,      py+2, COLW-3, RH-4, true);   // BPM
+    miniPlot(COLW+1, py+2, COLW-3, RH-4, false);  // SpO2
+  }
   char alertText[48] = "ALERT:";
   if(alertMask & ALERT_HR_LOW) strlcat(alertText," HR LOW",sizeof(alertText));
   if(alertMask & ALERT_HR_HIGH) strlcat(alertText," HR HIGH",sizeof(alertText));
@@ -550,7 +676,7 @@ void renderLive(const ReadingSnapshot& reading,RadioState radioState){
                                   stale,HR_LOW,HR_HIGH,SPO2_LOW);
   LiveRenderKey key=makeLiveRenderKey(reading,radioState,stale,alertMask,minuteOfDay());
   if(!g_renderKeyValid || key!=g_lastRenderKey){
-    drawLive(reading,radioState,stale,alertMask);
+    drawLive(reading,radioState,stale,alertMask,key,g_lastRenderKey,!g_renderKeyValid);
     g_lastRenderKey=key;
     g_renderKeyValid=true;
   }
@@ -724,9 +850,14 @@ void exitExport(){
 // sample would fire the tap action at the start of every swipe.
 // Returns 0 none, 1 tap (position in tx,ty), 2 swipe up, 3 swipe down.
 bool g_touching=false;
+// The one touch sample taken per loop pass. readGesture resolves taps and swipes on lift-off;
+// the three-second hold needs the same raw sample while the finger is still down, and sampling
+// the panel twice a pass to get it would be pure waste.
+bool g_touchDown=false; int g_touchX=0, g_touchY=0;
 int readGesture(int& tx,int& ty){
   static int x0,y0,x1,y1; static uint32_t t0=0;
   int sx,sy; bool now=touchXY(sx,sy);
+  g_touchDown=now; if(now){ g_touchX=sx; g_touchY=sy; }
   if(now){
     if(!g_touching){ g_touching=true; x0=x1=sx; y0=y1=sy; t0=millis(); }
     else { x1=sx; y1=sy; }
@@ -774,6 +905,8 @@ void setup(){
   logBoot();                                      // evidence for tomorrow morning: why did it restart?
   applyBrightness(); applyTheme();
   bootMsg("Loading history..."); loadCsvToday();
+  loadContacts(); reconcileOpenEpisode();
+  if(g_alarm.state==AlarmState::ALARM){ view=ALARM; setBacklight(255); }
   bootMsg("Bluetooth...");
   BLEDevice::init(""); g_bleScanner=BLEDevice::getScan();
   g_bleScanner->setAdvertisedDeviceCallbacks(new CB(),true);
@@ -784,9 +917,75 @@ void setup(){
   Serial.printf("[ready] sd=%d time=%d\n",g_sdReady,g_timeReady);
 }
 
+// Entering the alarm: the screen is taken over and brightness forced up regardless of night mode,
+// and the onset is on the card before anything else can go wrong.
+void onAlarmStarted(const ReadingSnapshot& r){
+  g_selfTest=false;                 // a real alarm during a self-test must not be labelled TEST
+  view=ALARM; setBacklight(255); g_renderKeyValid=false; g_alarmKeyValid=false;
+  logAlert("ONSET",r.heartRate,r.oxygenSaturation,alarmCauseName(g_alarm.cause));
+  Serial.printf("[alarm] %s hr=%d\n",alarmCauseName(g_alarm.cause),r.heartRate);
+}
+
+void leaveAlarmView(){
+  g_selfTest=false; view=LIVE; applyBrightness(); applyTheme();
+  g_renderKeyValid=false; g_alarmKeyValid=false; tft.fillScreen(BG);
+}
+
+// The alarm owns the screen but not the radio: unlike export mode, BLE keeps running underneath,
+// so the trace and the numbers stay live while the alarm is up.
+void serviceAlarmView(const ReadingSnapshot& reading){
+  const HoldResult hold=holdUpdate(g_hold,g_touchDown,g_touchX,g_touchY,millis(),
+                                   HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
+
+  if(hold.completed){
+    if(!g_selfTest){
+      logAlert("DISMISS",reading.heartRate,reading.oxygenSaturation,"dismissed");
+      alarmDismiss(g_alarm,millis());
+    }
+    leaveAlarmView(); return;
+  }
+  if(g_selfTest && static_cast<uint32_t>(millis()-g_selfTestStart)>=SELFTEST_DURATION_S*1000UL){
+    leaveAlarmView(); return;
+  }
+
+  const uint32_t nowE=nowEpochOrZero();
+  AlarmAppearance a;
+  a.machine=&g_alarm; a.contacts=&g_contacts;
+  a.heartRate=reading.heartRate; a.oxygen=reading.oxygenSaturation;
+  a.oxygenAgeMin = (g_spo2StampEpoch && nowE>=g_spo2StampEpoch)
+                     ? static_cast<int>((nowE-g_spo2StampEpoch)/60) : -1;
+  a.elapsedS = g_selfTest ? 0 : alarmElapsedS(g_alarm,nowE);
+  a.selfTest=g_selfTest;
+  a.selfTestLeftS=static_cast<int>(SELFTEST_DURATION_S-(millis()-g_selfTestStart)/1000);
+
+  // Three independent repaints, so the fastest-changing thing does not drag the slowest through
+  // a redraw: the vitals and trace only when a new reading lands (~20 s), the timer once a
+  // second in its own corner, the frame twice a second as six thin rectangles.
+  const int key = reading.sequence*7 + reading.heartRate + reading.oxygenSaturation*3;
+  if(!g_alarmKeyValid || key!=g_alarmKey){
+    g_alarmKey=key; g_alarmKeyValid=true;
+    drawAlarmStatic(a); drawAlarmTimer(a); drawAlarmHold(hold,g_selfTest);
+  }
+
+  static uint32_t lastTimerS=0xFFFFFFFF;
+  const uint32_t showS = g_selfTest ? (uint32_t)a.selfTestLeftS : a.elapsedS;
+  if(showS!=lastTimerS){ lastTimerS=showS; drawAlarmTimer(a); }
+
+  static bool lastFrame=false, lastHoldActive=false; static uint8_t lastPct=255;
+  const bool frameOn=(millis()/ALARM_FLASH_MS)%2==0;
+  if(frameOn!=lastFrame){ lastFrame=frameOn; drawAlarmFrame(frameOn); }
+  if(hold.active!=lastHoldActive || hold.percent!=lastPct){
+    lastHoldActive=hold.active; lastPct=hold.percent; drawAlarmHold(hold,g_selfTest);
+  }
+}
+
 void loop(){
   static uint32_t lastTouch=0;
-  int tx=0,ty=0; int g=readGesture(tx,ty);
+  // Always sampled, even when the alarm owns the screen, so g_touchDown/g_touchX/g_touchY are
+  // fresh for the hold below and the panel is only read once per pass. The gesture result itself
+  // is ignored while the alarm is up - see the view guards on each handler.
+  int tx=0,ty=0; int g = readGesture(tx,ty);
+  const bool alarmOwned = (view==ALARM || g_selfTest);
 
   // Export mode owns the loop: no BLE, no live view, just serve the page until told to stop.
   if(view==EXPORT){
@@ -797,15 +996,47 @@ void loop(){
     delay(5);                                    // keep the server responsive
     return;
   }
-  if(g==2 && view==LIVE){ enterExport(); return; }   // swipe up -> share the logged data
+  // Swipe up -> share the logged data, but never during an alarm: enterExport() deinitialises
+  // Bluetooth and replaces the screen, which would hide the alarm and stop the readings feeding it.
+  if(g==2 && view==LIVE && g_alarm.state!=AlarmState::ALARM){ enterExport(); return; }
 
-  if(g==1){
+  // Hold the HEART cell to run the alarm self-check. This resolves while still touching, unlike
+  // readGesture()'s tap, because the countdown has to be drawn during the hold; holdConsumedTap
+  // then suppresses the release so testing the alarm does not also open the 24-hour chart.
+  // Guarded against g_selfTest: during a self-test the view is still LIVE, and without this both
+  // this block and serviceAlarmView would drive the same HoldState in one pass.
+  bool holdingHeart=false;
+  if(view==LIVE && !g_selfTest){
+    const bool onHeart = g_touchDown && g_touchY>=HDR && g_touchX<COLW;
+    const HoldResult h=holdUpdate(g_hold,onHeart,g_touchX,g_touchY,millis(),HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
+    if(h.completed){
+      g_selfTest=true; g_selfTestStart=millis(); setBacklight(255);
+      g_alarmKeyValid=false; Serial.println("[alarm] self-test");
+      return;
+    }
+    static bool wasHolding=false;
+    if(h.active){                               // same countdown the alarm screen uses
+      holdingHeart=true;                        // suppress renderLive, or it erases the digit
+      char c[8]; snprintf(c,sizeof(c),"%u",(unsigned)h.secondsLeft);
+      tft.setFont(&fonts::FreeSansBold9pt7b);
+      tft.setTextColor(TFT_YELLOW,BG);          // opaque background so 3->2->1 overwrites cleanly
+      tft.setTextDatum(textdatum_t::middle_center); tft.drawString(c,COLW/2,HDR+RH/2);
+      wasHolding=true;
+    } else if(wasHolding){                      // abandoned: repaint the live view over the digit
+      wasHolding=false; g_renderKeyValid=false;
+    }
+    if(g==1 && holdConsumedTap(g_hold)) g=0;
+  }
+
+  // Gesture ACTIONS are suppressed while the alarm owns the screen - the sample above is still
+  // taken, but a tap must not open the 24-hour chart on top of a running alarm or self-test.
+  if(g==1 && !alarmOwned){
     lastTouch=millis();
     if(view==LIVE){
       if(ty>=HDR){                              // tap a column (number or its sparkline) -> 24h chart
         plotMetric = (tx<COLW)?0:1; view=PLOT; drawPlot();
       }
-    } else { // PLOT: any tap cycles the bin size
+    } else if(view==PLOT){ // any tap cycles the bin size
       plotBinMin = (plotBinMin==60)?30:(plotBinMin==30)?15:60; drawPlot();
     }
   }
@@ -813,11 +1044,40 @@ void loop(){
   if(view==PLOT && millis()-lastTouch>10000){ view=LIVE; g_renderKeyValid=false; tft.fillScreen(BG); }
   RadioState radioState = serviceRadioRecovery(millis());
   ReadingSnapshot reading = readSnapshot();
-  if(view==LIVE) renderLive(reading,radioState);
 
-  // day/night backlight, checked every 10 s (no-op unless the level actually changes)
+  // ---- critical alarm ----
+  // Driven every pass, before rendering, so the alarm can take the screen in the same pass it
+  // fires rather than a frame later.
+  {
+    const bool stale = reading.lastPacketMs==0 ||
+                       static_cast<uint32_t>(millis()-reading.lastPacketMs)>STALE_MS;
+    static int lastAlarmSeq=-1;
+    if(reading.sequence!=lastAlarmSeq && reading.lastPacketMs!=0 &&
+       static_cast<uint32_t>(millis()-reading.lastPacketMs)<3000){
+      lastAlarmSeq=reading.sequence;
+      const uint32_t nowE=nowEpochOrZero();      // one clock read per reading, not three
+      if(reading.oxygenSaturation>0) g_spo2StampEpoch=nowE;
+      AlarmEvent ev=alarmOnReading(g_alarm,ALARM_CFG,reading.heartRate,millis(),nowE);
+      if(ev.alarmStarted) onAlarmStarted(reading);
+      if(ev.episodeResolved) logAlert("RESOLVED",reading.heartRate,reading.oxygenSaturation,"");
+    }
+    AlarmEvent tick=alarmTick(g_alarm,ALARM_CFG,millis(),stale);
+    if(tick.alarmStarted) onAlarmStarted(reading);
+  }
+
+  if(view==ALARM || g_selfTest){
+    serviceAlarmView(reading);
+    // Fall through to logging below so the CSV and the trace keep filling behind the alarm.
+  }
+  else if(view==LIVE && !holdingHeart) renderLive(reading,radioState);
+
+  // day/night backlight, checked every 10 s (no-op unless the level actually changes).
+  // Skipped while the alarm is up: it forces full brightness regardless of the hour, and letting
+  // night mode dim it back down would be the single worst bug this feature could have.
   static uint32_t lastBl=0;
-  if(millis()-lastBl>10000){ lastBl=millis(); applyBrightness(); applyTheme(); }
+  if(view!=ALARM && !g_selfTest && millis()-lastBl>10000){
+    lastBl=millis(); applyBrightness(); applyTheme();
+  }
 
   // log + bin new readings
   static int lastLogged=-1;
@@ -826,7 +1086,7 @@ void loop(){
     lastLogged=reading.sequence;
     logRow(reading.heartRate,reading.oxygenSaturation,reading.skinC,reading.skinValid);
     int mod=minuteOfDay(); if(mod>=0) addReading(reading.heartRate,reading.oxygenSaturation,mod);
-    pushHist(reading.heartRate,reading.oxygenSaturation);  // feed the 1-hour sparklines
+    pushHist(reading.heartRate,reading.oxygenSaturation,nowEpochOrZero());  // feed the 1-hour sparklines
   }
   delay(g_touching?15:60);                       // sample faster mid-gesture so swipes track well
 }

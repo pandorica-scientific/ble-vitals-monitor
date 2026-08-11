@@ -194,6 +194,84 @@ during the day. Change the window, the brightness levels or the palette with `NI
 `FORCE_NIGHT 1` to check the dark theme without waiting until 20:00. Until the clock is set the
 display stays in the daytime look.
 
+### Critical heart-rate alarm
+
+Above the ordinary warning colours there is one alarm that takes the whole screen. It exists for a
+single situation: a **sustained** heart rate at or above **200 bpm**.
+
+**What triggers it.** A reading at or above 200 starts a one-minute confirmation window. Any
+reading below 180 during that minute cancels it — the rate came down and nothing happened. At the
+end of the minute the alarm fires if the latest reading is at or above **190** *and* either two
+readings reached 200, **or** the rate stopped falling. That second path matters: `205, 195, 185` is
+a rate coming down and stays quiet, while `205, 185, 195` dipped and came back and does not.
+
+Because the minute is counted rather than thrown away, the timer already reads `01:00` when the
+alarm appears. If the rate oscillates either side of 200 the window restarts without cancelling, so
+confirmation can take longer — the timer counts from the first crossing, so that delay is visible
+rather than hidden.
+
+Two things also raise it immediately, without waiting for the window:
+
+- **the signal dies while armed** — silence after a reading at or above 200 is not a drop;
+- **an implausible collapse**, a step from 170-plus to 60-or-less, which is either the heart-rate
+  byte wrapping past 255 or a genuine emergency. The firmware cannot tell those apart and does not
+  try: both alarm.
+
+**What it shows.** Current rate, peak, oxygen **with its age**, elapsed time since onset, a
+high-resolution trace of the last 10 minutes (widening to 30 and 60 to keep the onset on screen),
+and your emergency phone numbers. Dropouts in the trace are drawn as shaded bands rather than a
+line across the gap, because a line across four missing minutes reads as a steady rate for four
+minutes. Only the border flashes, so the numbers stay readable.
+
+**Clearing it.** Press and hold anywhere for **three seconds**, watching the countdown. It latches
+until you do — no reading clears it, no dropout clears it, and it survives a reboot via RTC memory
+and `/alerts.csv`. After a dismissal it stays quiet for ten minutes, then returns if the rate is
+still high, so it cannot be silenced and forgotten. Swiping up to export is refused while it is up.
+
+**Test it.** Hold the **HEART** cell for three seconds to run a ten-second `TEST` alarm — real
+brightness, real flashing, no log entry. **Run it from where you actually sleep, with the lights as
+they normally are.** It is the only way to find out whether the alarm reaches you.
+
+**`/contacts.txt`** on the SD card holds the numbers: up to two lines of up to 30 characters,
+rendered exactly as written, so numbers sharing a prefix can go on one line:
+
+```
+224 432 969 / 931 / 970 / 973
+```
+
+The repository ships no default and contains nobody's real numbers — a stranger who builds this
+must not get someone else's hospital on their screen. Without the file the alarm still works, just
+without numbers.
+
+**`/alerts.csv`** records every episode, append-only so a power cut mid-episode still leaves a
+readable file:
+
+```csv
+timestamp,event,hr_bpm,spo2_pct,detail
+2026-08-10 03:14:22,ONSET,214,94,CONFIRMED_HIGH
+2026-08-10 03:19:41,RESOLVED,176,93,
+2026-08-10 03:20:58,DISMISS,171,93,dismissed
+```
+
+A six-minute episode that resolves on its own at three in the morning leaves a record worth showing
+a clinician. Neither this file nor `/contacts.txt` is served by export mode, which whitelists
+`/vitals_*.csv` only — pull the card to read them.
+
+Thresholds and timings are the `HR_CRIT` / `HR_SUSTAIN` / `HR_CANCEL` block at the top of
+`cyd_vitals.ino`.
+
+> **The alarm is light only.** The board has no speaker and does not use the network, so it reaches
+> someone in the same room and nobody through a closed door. Whether it wakes anyone is a question
+> about where the board sits, and no firmware setting changes that.
+>
+> **Silence is not an all-clear.** The wristband loses contact when the baby moves, and a distressed
+> baby moves. The board can also brown out, fill its card, or hang. Any of these produce no alarm.
+>
+> **The rate can read low when it is high.** The heart rate arrives as a single byte and cannot
+> express more than 255. The collapse rule above defends against a wrap but cannot rule it out.
+>
+> **This is not a medical device** and does not decide whether to seek care.
+
 ### Power draw
 
 The board runs off 5 V USB and the on-board AMS1117 is a **linear** regulator, so roughly a third of
@@ -305,6 +383,12 @@ in *System Settings → Privacy & Security → Bluetooth* on first run.
 ```
 firmware/
   cyd_vitals/       main firmware: display + BLE + WiFi/NTP + SD CSV + 24h touch plots
+                    critical_alarm.h  alarm state machine (pure, natively tested)
+                    trace_window.h    alarm trace windowing and dropout gaps
+                    hold_gesture.h    three-second hold with countdown
+                    alert_log.h       /alerts.csv rows and boot reconciliation
+                    contacts.h        /contacts.txt parsing
+                    alarm_render.h    alarm screen drawing
   reader_serial/    minimal ESP32 reader — decoded vitals over serial (no display)
   bandsniff/        reception test — confirms a classic ESP32 can hear the wristband
   provision_wifi/   one-time helper to write /wifi.txt to the SD card
