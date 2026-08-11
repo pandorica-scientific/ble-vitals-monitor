@@ -850,9 +850,14 @@ void exitExport(){
 // sample would fire the tap action at the start of every swipe.
 // Returns 0 none, 1 tap (position in tx,ty), 2 swipe up, 3 swipe down.
 bool g_touching=false;
+// The one touch sample taken per loop pass. readGesture resolves taps and swipes on lift-off;
+// the three-second hold needs the same raw sample while the finger is still down, and sampling
+// the panel twice a pass to get it would be pure waste.
+bool g_touchDown=false; int g_touchX=0, g_touchY=0;
 int readGesture(int& tx,int& ty){
   static int x0,y0,x1,y1; static uint32_t t0=0;
   int sx,sy; bool now=touchXY(sx,sy);
+  g_touchDown=now; if(now){ g_touchX=sx; g_touchY=sy; }
   if(now){
     if(!g_touching){ g_touching=true; x0=x1=sx; y0=y1=sy; t0=millis(); }
     else { x1=sx; y1=sy; }
@@ -929,8 +934,8 @@ void leaveAlarmView(){
 // The alarm owns the screen but not the radio: unlike export mode, BLE keeps running underneath,
 // so the trace and the numbers stay live while the alarm is up.
 void serviceAlarmView(const ReadingSnapshot& reading){
-  int sx=0,sy=0; const bool touching=touchXY(sx,sy);
-  const HoldResult hold=holdUpdate(g_hold,touching,sx,sy,millis(),HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
+  const HoldResult hold=holdUpdate(g_hold,g_touchDown,g_touchX,g_touchY,millis(),
+                                   HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
 
   if(hold.completed){
     if(!g_selfTest){
@@ -976,8 +981,11 @@ void serviceAlarmView(const ReadingSnapshot& reading){
 
 void loop(){
   static uint32_t lastTouch=0;
+  // Always sampled, even when the alarm owns the screen, so g_touchDown/g_touchX/g_touchY are
+  // fresh for the hold below and the panel is only read once per pass. The gesture result itself
+  // is ignored while the alarm is up - see the view guards on each handler.
+  int tx=0,ty=0; int g = readGesture(tx,ty);
   const bool alarmOwned = (view==ALARM || g_selfTest);
-  int tx=0,ty=0; int g = alarmOwned ? 0 : readGesture(tx,ty);
 
   // Export mode owns the loop: no BLE, no live view, just serve the page until told to stop.
   if(view==EXPORT){
@@ -999,9 +1007,8 @@ void loop(){
   // this block and serviceAlarmView would drive the same HoldState in one pass.
   bool holdingHeart=false;
   if(view==LIVE && !g_selfTest){
-    int hx=0,hy=0; const bool ht=touchXY(hx,hy);
-    const bool onHeart = ht && hy>=HDR && hx<COLW;
-    const HoldResult h=holdUpdate(g_hold,onHeart,hx,hy,millis(),HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
+    const bool onHeart = g_touchDown && g_touchY>=HDR && g_touchX<COLW;
+    const HoldResult h=holdUpdate(g_hold,onHeart,g_touchX,g_touchY,millis(),HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
     if(h.completed){
       g_selfTest=true; g_selfTestStart=millis(); setBacklight(255);
       g_alarmKeyValid=false; Serial.println("[alarm] self-test");
@@ -1021,13 +1028,15 @@ void loop(){
     if(g==1 && holdConsumedTap(g_hold)) g=0;
   }
 
-  if(g==1){
+  // Gesture ACTIONS are suppressed while the alarm owns the screen - the sample above is still
+  // taken, but a tap must not open the 24-hour chart on top of a running alarm or self-test.
+  if(g==1 && !alarmOwned){
     lastTouch=millis();
     if(view==LIVE){
       if(ty>=HDR){                              // tap a column (number or its sparkline) -> 24h chart
         plotMetric = (tx<COLW)?0:1; view=PLOT; drawPlot();
       }
-    } else { // PLOT: any tap cycles the bin size
+    } else if(view==PLOT){ // any tap cycles the bin size
       plotBinMin = (plotBinMin==60)?30:(plotBinMin==30)?15:60; drawPlot();
     }
   }
