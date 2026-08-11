@@ -11,6 +11,7 @@
 #include <WiFi.h>
 
 #include "../cyd_vitals/wifi_failover.h"
+#include "../cyd_vitals/contacts.h"
 
 #define SD_SCK 18
 #define SD_MISO 19
@@ -122,6 +123,37 @@ bool writeCredentialTransactional(const char* target, const char* temp,
   return true;
 }
 
+// /contacts.txt holds the emergency numbers shown on the alarm screen. Like the credentials
+// above, they arrive over the serial connection at runtime and are never compiled into this
+// sketch: the repository is published for other people to build, and one family's hospital
+// numbers must never end up on a stranger's screen.
+bool writeContacts(const String& first, const String& second) {
+  File file = SD.open("/contacts.txt", FILE_WRITE);
+  if (!file) return false;
+  file.println(first);
+  if (second.length() > 0) file.println(second);
+  file.flush();
+  file.close();
+
+  // Read it back through the same parser the monitor uses, so "stored" means the monitor will
+  // actually show these lines rather than merely that bytes reached the card.
+  File check = SD.open("/contacts.txt", FILE_READ);
+  if (!check) return false;
+  char buf[128];
+  size_t n = check.readBytes(buf, sizeof(buf) - 1);
+  buf[n] = '\0';
+  check.close();
+
+  Contacts parsed{};
+  parseContacts(buf, parsed);
+  int expected = second.length() > 0 ? 2 : 1;
+  if (parsed.count != expected) return false;
+  if (first.substring(0, CONTACT_LEN - 1) != String(parsed.line[0])) return false;
+  if (expected == 2 && second.substring(0, CONTACT_LEN - 1) != String(parsed.line[1])) return false;
+  for (int i = 0; i < parsed.count; ++i) Serial.printf("[sd] line %d: %s\n", i + 1, parsed.line[i]);
+  return true;
+}
+
 bool testSelectedNetwork(const String& ssid, const String& password) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), password.c_str());
@@ -141,9 +173,30 @@ bool testSelectedNetwork(const String& ssid, const String& password) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== Wi-Fi credential provisioner ===");
+  Serial.println("\n=== CYD SD card provisioner ===");
 
-  String slotLabel = readLine("slot (primary, backup, or backup2), then Enter:");
+  String slotLabel = readLine("slot (primary, backup, backup2, or contacts), then Enter:");
+
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS, sdSPI) || SD.cardType() == CARD_NONE) {
+    Serial.println("[SD] init FAILED");
+    return;
+  }
+
+  if (slotLabel == "contacts") {
+    Serial.printf("up to two lines, %d characters each, shown verbatim on the alarm screen\n",
+                  CONTACT_LEN - 1);
+    String first = readLine("line 1, then Enter:");
+    String second = readLine("line 2 (blank for none), then Enter:");
+    if (first.length() == 0) {
+      Serial.println("invalid empty line 1");
+      return;
+    }
+    bool stored = writeContacts(first, second);
+    Serial.printf("[sd] contacts stored=%s\n", stored ? "yes" : "no");
+    return;
+  }
+
   WifiSlot selectedSlot = WifiSlot::PRIMARY;
   if (!parseWifiSlot(slotLabel.c_str(), selectedSlot)) {
     Serial.println("invalid slot");
@@ -153,12 +206,6 @@ void setup() {
   const char* target = wifiCredentialPath(selectedSlot);
   const char* temp = wifiCredentialTempPath(selectedSlot);
   const char* rollback = wifiCredentialRollbackPath(selectedSlot);
-
-  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, sdSPI) || SD.cardType() == CARD_NONE) {
-    Serial.println("[SD] init FAILED");
-    return;
-  }
 
   String ssid = readLine("SSID, then Enter:");
   String password = readLine("password, then Enter:");

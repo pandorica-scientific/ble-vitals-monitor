@@ -1,4 +1,9 @@
 #include "../firmware/cyd_vitals/band_protocol.h"
+#include "../firmware/cyd_vitals/critical_alarm.h"
+#include "../firmware/cyd_vitals/trace_window.h"
+#include "../firmware/cyd_vitals/hold_gesture.h"
+#include "../firmware/cyd_vitals/alert_log.h"
+#include "../firmware/cyd_vitals/contacts.h"
 #include "../firmware/cyd_vitals/live_render_key.h"
 #include "../firmware/cyd_vitals/radio_health.h"
 #include "../firmware/cyd_vitals/wifi_failover.h"
@@ -220,12 +225,363 @@ static void testLiveRenderKey() {
   expect(first != second, "new minute redraws clock");
 }
 
+// Feed readings 20 s apart while ticking every second, exactly as the main loop does, and run
+// long enough for at least one confirmation window to close.
+static AlarmMachine runWindow(const AlarmConfig& cfg, const std::vector<int>& readings) {
+  AlarmMachine m{};
+  const uint32_t epoch0 = 1'000'000;
+  uint32_t endMs = static_cast<uint32_t>(readings.size()) * 20'000;
+  if (endMs < cfg.confirmMs) endMs = cfg.confirmMs;
+  endMs += 1'000;
+  for (uint32_t t = 0; t <= endMs; t += 1'000) {
+    const size_t idx = t / 20'000;
+    if (t % 20'000 == 0 && idx < readings.size()) {
+      alarmOnReading(m, cfg, readings[idx], t, epoch0 + t / 1000);
+    }
+    alarmTick(m, cfg, t, false);
+  }
+  return m;
+}
+
+static void testCriticalAlarm() {
+  const AlarmConfig cfg{};
+
+  // 1: one qualifying reading arms but does not alarm
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 205, 0, 1'000'000);
+    expect(m.state == AlarmState::ARMED, "one reading at 200 arms");
+    alarmTick(m, cfg, 5'000, false);
+    expect(m.state == AlarmState::ARMED, "still armed before the window closes");
+  }
+
+  // 2: sustained readings alarm, onset is the FIRST reading
+  {
+    AlarmMachine m = runWindow(cfg, {205, 205, 205, 205});
+    expect(m.state == AlarmState::ALARM, "sustained 205 alarms");
+    expect(m.cause == AlarmCause::CONFIRMED_HIGH, "cause is CONFIRMED_HIGH");
+    expect(m.onsetEpoch == 1'000'000, "onset is the first qualifying reading");
+  }
+
+  // 3: a reading below cancel returns to IDLE
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 205, 0, 1'000'000);
+    alarmOnReading(m, cfg, 179, 20'000, 1'000'020);
+    expect(m.state == AlarmState::IDLE, "179 cancels the window");
+  }
+
+  // 4: staleness while armed escalates
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 205, 0, 1'000'000);
+    AlarmEvent e = alarmTick(m, cfg, 30'000, true);
+    expect(m.state == AlarmState::ALARM, "stale while armed alarms");
+    expect(m.cause == AlarmCause::LOST_WHILE_CRITICAL, "cause is LOST_WHILE_CRITICAL");
+    expect(e.alarmStarted, "the transition is reported once");
+    AlarmEvent again = alarmTick(m, cfg, 31'000, true);
+    expect(!again.alarmStarted, "repeated stale ticks do not re-fire");
+  }
+
+  // 5: staleness while idle does nothing
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 140, 0, 1'000'000);
+    alarmTick(m, cfg, 30'000, true);
+    expect(m.state == AlarmState::IDLE, "stale while idle does not alarm");
+  }
+
+  // 6-17: window evaluation table
+  struct WindowCase { std::vector<int> readings; bool alarms; const char* why; };
+  const std::vector<WindowCase> cases = {
+    {{205, 195, 185}, false, "falling and ends below sustain"},
+    {{205, 185, 195}, true,  "rose again, ends above sustain"},
+    {{205, 195, 195}, true,  "flat is not resolving"},
+    {{205, 195, 196}, true,  "a one-beat rise is still not resolving"},
+    {{205, 198, 193}, false, "strictly falling with one high reading"},
+    {{205, 200, 195}, true,  "count path fires despite falling"},
+    {{205, 185, 188}, false, "rose but ends below sustain"},
+    {{205, 195, 205}, true,  "two high readings, ends high"},
+    {{205, 205},      true,  "count is absolute, not a fraction"},
+    {{205, 200, 190}, true,  "sustain boundary is inclusive"},
+  };
+  for (const WindowCase& c : cases) {
+    AlarmMachine m = runWindow(cfg, c.readings);
+    expect((m.state == AlarmState::ALARM) == c.alarms, c.why);
+  }
+
+  // a reading below crit never arms
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 199, 0, 1'000'000);
+    expect(m.state == AlarmState::IDLE, "199 never arms");
+  }
+
+  // a window completing on a single reading is treated as not resolving
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 205, 0, 1'000'000);
+    alarmTick(m, cfg, 60'000, false);
+    expect(m.state == AlarmState::ALARM, "single-reading window fails toward alarming");
+  }
+
+  // an unconfirmed window restarts instead of resetting, keeping onset
+  {
+    AlarmMachine m = runWindow(cfg, {205, 198, 193});
+    expect(m.state == AlarmState::ARMED, "unconfirmed window stays armed");
+    expect(m.onsetEpoch == 1'000'000, "onset survives a window restart");
+  }
+
+  // oscillation never cancels and eventually alarms
+  {
+    AlarmMachine m = runWindow(cfg, {205, 195, 205, 195, 205, 205, 205});
+    expect(m.state == AlarmState::ALARM, "oscillation eventually confirms");
+    expect(m.onsetEpoch == 1'000'000, "onset is still the first crossing");
+  }
+
+  // implausible collapse alarms immediately, without a window
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 190, 0, 1'000'000);
+    AlarmEvent e = alarmOnReading(m, cfg, 24, 20'000, 1'000'020);
+    expect(m.state == AlarmState::ALARM, "190 then 24 alarms at once");
+    expect(m.cause == AlarmCause::IMPLAUSIBLE_COLLAPSE, "cause is IMPLAUSIBLE_COLLAPSE");
+    expect(e.alarmStarted, "collapse reports the transition");
+  }
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 190, 0, 1'000'000);
+    alarmOnReading(m, cfg, 85, 20'000, 1'000'020);
+    expect(m.state == AlarmState::IDLE, "190 then 85 is not a collapse");
+  }
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 100, 0, 1'000'000);
+    alarmOnReading(m, cfg, 40, 20'000, 1'000'020);
+    expect(m.state == AlarmState::IDLE, "100 then 40 is not a collapse");
+  }
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 190, 0, 1'000'000);
+    alarmOnReading(m, cfg, 0, 20'000, 1'000'020);
+    expect(m.state == AlarmState::IDLE, "a zero reading is not a collapse");
+  }
+
+  // the alarm is terminal, peak tracks the maximum, resolution is reported once
+  {
+    AlarmMachine m = runWindow(cfg, {205, 221, 205, 205});
+    expect(m.state == AlarmState::ALARM, "alarm is up");
+    expect(m.peak == 221, "peak tracks the maximum");
+    AlarmEvent e = alarmOnReading(m, cfg, 140, 100'000, 1'000'100);
+    expect(m.state == AlarmState::ALARM, "a normal reading does not clear the alarm");
+    expect(e.episodeResolved, "the drop below crit is reported once");
+    AlarmEvent again = alarmOnReading(m, cfg, 138, 120'000, 1'000'120);
+    expect(!again.episodeResolved, "resolution is reported only once");
+  }
+
+  // dismissal returns to IDLE and snoozes
+  {
+    AlarmMachine m = runWindow(cfg, {205, 205, 205, 205});
+    alarmDismiss(m, 200'000);
+    expect(m.state == AlarmState::IDLE, "dismissal returns to IDLE");
+    AlarmMachine snoozed = m;
+    alarmOnReading(snoozed, cfg, 210, 210'000, 1'000'210);
+    for (uint32_t t = 0; t <= 80'000; t += 1'000) {
+      alarmTick(snoozed, cfg, 210'000 + t, false);
+    }
+    expect(snoozed.state != AlarmState::ALARM, "no alarm within the snooze");
+    AlarmMachine later = m;
+    alarmOnReading(later, cfg, 210, 900'000, 1'001'000);
+    for (uint32_t t = 0; t <= 80'000; t += 1'000) {
+      alarmTick(later, cfg, 900'000 + t, false);
+    }
+    expect(later.state == AlarmState::ALARM, "alarm returns after the snooze");
+  }
+
+  // elapsed counts from onset
+  {
+    AlarmMachine m = runWindow(cfg, {205, 205, 205, 205});
+    expect(alarmElapsedS(m, 1'000'396) == 396, "elapsed counts from onset");
+  }
+}
+
+static void testTraceWindow() {
+  expect(traceWindowMinutes(0) == 10, "a fresh episode uses a ten-minute window");
+  expect(traceWindowMinutes(9 * 60) == 10, "nine minutes still fits ten");
+  expect(traceWindowMinutes(12 * 60) == 30, "twelve minutes widens to thirty");
+  expect(traceWindowMinutes(40 * 60) == 60, "forty minutes widens to sixty");
+  expect(traceWindowMinutes(90 * 60) == 60, "ninety minutes stays capped at sixty");
+
+  expect(!traceIsGap(1'000'000, 1'000'020), "twenty seconds apart is not a gap");
+  expect(traceIsGap(1'000'000, 1'000'240), "four minutes apart is a gap");
+  expect(!traceIsGap(1'000'000, 1'000'030), "exactly the stale limit is not yet a gap");
+
+  expect(traceIsGap(1'000'000, 4'000'000'000u), "a huge difference is a gap, not an overflow");
+
+  const uint32_t clean[3] = {1'000'000, 1'000'020, 1'000'040};
+  expect(!tracePositional(clean, 3), "timestamped history uses a real time axis");
+  const uint32_t withZero[3] = {0, 1'000'020, 1'000'040};
+  expect(tracePositional(withZero, 3), "an unset clock forces the positional axis");
+}
+
+static void testHoldGesture() {
+  const uint32_t HOLD = 3'000;
+  const int MOVE = 20;
+
+  // released early: nothing fires, no residual progress
+  {
+    HoldState h{};
+    holdUpdate(h, true, 100, 100, 0, HOLD, MOVE);
+    HoldResult r = holdUpdate(h, true, 100, 100, 2'900, HOLD, MOVE);
+    expect(!r.completed, "a hold released at 2.9 s does not fire");
+    expect(r.active && r.secondsLeft == 1, "the countdown shows one second left");
+    HoldResult up = holdUpdate(h, false, 100, 100, 2'950, HOLD, MOVE);
+    expect(!up.completed && !up.active, "releasing clears the hold");
+    expect(up.percent == 0, "no residual progress remains");
+  }
+
+  // reaching the threshold fires exactly once
+  {
+    HoldState h{};
+    holdUpdate(h, true, 100, 100, 0, HOLD, MOVE);
+    HoldResult done = holdUpdate(h, true, 100, 100, 3'000, HOLD, MOVE);
+    expect(done.completed, "a hold reaching 3.0 s fires");
+    HoldResult more = holdUpdate(h, true, 100, 100, 3'500, HOLD, MOVE);
+    expect(!more.completed, "it does not fire again while still held");
+  }
+
+  // progress advances monotonically and only reaches full at the end
+  {
+    HoldState h{};
+    holdUpdate(h, true, 100, 100, 0, HOLD, MOVE);
+    uint8_t last = 0;
+    for (uint32_t t = 100; t < 3'000; t += 100) {
+      HoldResult r = holdUpdate(h, true, 100, 100, t, HOLD, MOVE);
+      expect(r.percent >= last, "progress never goes backwards");
+      expect(r.percent < 100, "progress is not full before the end");
+      last = r.percent;
+    }
+    HoldResult end = holdUpdate(h, true, 100, 100, 3'000, HOLD, MOVE);
+    expect(end.percent == 100, "progress is full at the end");
+  }
+
+  // moving too far abandons the hold
+  {
+    HoldState h{};
+    holdUpdate(h, true, 100, 100, 0, HOLD, MOVE);
+    HoldResult moved = holdUpdate(h, true, 140, 100, 1'000, HOLD, MOVE);
+    expect(!moved.active, "a drag abandons the hold");
+    HoldResult later = holdUpdate(h, true, 140, 100, 3'500, HOLD, MOVE);
+    expect(!later.completed, "an abandoned hold cannot complete");
+  }
+
+  // a completed hold suppresses the tap that would otherwise fire on release
+  {
+    HoldState h{};
+    holdUpdate(h, true, 100, 100, 0, HOLD, MOVE);
+    holdUpdate(h, true, 100, 100, 3'000, HOLD, MOVE);
+    expect(holdConsumedTap(h), "a completed hold consumes the release");
+    holdUpdate(h, false, 100, 100, 3'100, HOLD, MOVE);
+    expect(!holdConsumedTap(h), "the flag clears once the finger is up");
+  }
+}
+
+static void testAlertLog() {
+  char row[128];
+  formatAlertRow(row, sizeof(row), "2026-08-10 03:14:22", "ONSET", 214, 94, "CONFIRMED_HIGH");
+  expect(std::string(row) == "2026-08-10 03:14:22,ONSET,214,94,CONFIRMED_HIGH",
+         "an onset row is formatted exactly");
+
+  formatAlertRow(row, sizeof(row), "2026-08-10 03:19:41", "RESOLVED", 176, 93, "");
+  expect(std::string(row) == "2026-08-10 03:19:41,RESOLVED,176,93,",
+         "an empty detail still emits its column");
+
+  expect(std::string(alarmCauseName(AlarmCause::CONFIRMED_HIGH)) == "CONFIRMED_HIGH",
+         "cause names are stable strings");
+  expect(std::string(alarmCauseName(AlarmCause::LOST_WHILE_CRITICAL)) == "LOST_WHILE_CRITICAL",
+         "lost-while-critical has a name");
+
+  // an ONSET with no later DISMISS leaves an open episode
+  {
+    OpenEpisode s{};
+    reconcileAlertLine("2026-08-10 03:14:22,ONSET,214,94,CONFIRMED_HIGH", 1'000'000, s);
+    expect(s.open && s.onsetEpoch == 1'000'000, "an unmatched onset is open");
+  }
+  // a DISMISS closes it
+  {
+    OpenEpisode s{};
+    reconcileAlertLine("2026-08-10 03:14:22,ONSET,214,94,CONFIRMED_HIGH", 1'000'000, s);
+    reconcileAlertLine("2026-08-10 03:20:58,DISMISS,171,93,peak=221", 1'000'396, s);
+    expect(!s.open, "a dismiss closes the episode");
+  }
+  // two closed episodes then an open third
+  {
+    OpenEpisode s{};
+    reconcileAlertLine("a,ONSET,200,95,", 100, s);
+    reconcileAlertLine("b,DISMISS,150,95,", 200, s);
+    reconcileAlertLine("c,ONSET,210,95,", 300, s);
+    reconcileAlertLine("d,DISMISS,150,95,", 400, s);
+    reconcileAlertLine("e,ONSET,220,95,", 500, s);
+    expect(s.open && s.onsetEpoch == 500, "the third episode is the open one");
+  }
+  // RESOLVED does not close, and junk does not crash
+  {
+    OpenEpisode s{};
+    reconcileAlertLine("a,ONSET,200,95,", 100, s);
+    reconcileAlertLine("b,RESOLVED,150,95,", 200, s);
+    expect(s.open, "resolution does not close the episode - only dismissal does");
+    reconcileAlertLine("", 300, s);
+    reconcileAlertLine("timestamp,event,hr_bpm,spo2_pct,detail", 300, s);
+    reconcileAlertLine("truncated", 300, s);
+    expect(s.open, "a header, a blank line and a truncated line are ignored");
+  }
+}
+
+static void testContacts() {
+  {
+    Contacts c{};
+    parseContacts("224 432 969 / 931 / 970 / 973\n", c);
+    expect(c.count == 1, "one line parses to one entry");
+    expect(std::string(c.line[0]) == "224 432 969 / 931 / 970 / 973", "the line is verbatim");
+  }
+  {
+    Contacts c{};
+    parseContacts("first line\r\nsecond line\r\nthird line\r\n", c);
+    expect(c.count == 2, "more than two lines keeps the first two");
+    expect(std::string(c.line[1]) == "second line", "carriage returns are stripped");
+  }
+  {
+    Contacts c{};
+    parseContacts("012345678901234567890123456789EXTRA", c);
+    expect(c.count == 1, "an over-long line is still one entry");
+    expect(std::string(c.line[0]) == "012345678901234567890123456789",
+           "an over-long line is truncated to thirty characters");
+  }
+  {
+    Contacts c{};
+    parseContacts("", c);
+    expect(c.count == 0, "an empty file yields no lines");
+    parseContacts(nullptr, c);
+    expect(c.count == 0, "a missing file yields no lines");
+  }
+  {
+    Contacts c{};
+    parseContacts("\n\nreal line\n", c);
+    expect(c.count == 1 && std::string(c.line[0]) == "real line", "blank lines are skipped");
+  }
+}
+
 int main() {
   testBandDecoder();
   testReadingMerge();
   testRadioHealth();
   testWifiFailover();
   testLiveRenderKey();
+  testCriticalAlarm();
+  testTraceWindow();
+  testHoldGesture();
+  testAlertLog();
+  testContacts();
   if (failures) return EXIT_FAILURE;
   std::puts("firmware logic tests passed");
   return EXIT_SUCCESS;
