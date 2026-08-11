@@ -933,7 +933,7 @@ void leaveAlarmView(){
 
 // The alarm owns the screen but not the radio: unlike export mode, BLE keeps running underneath,
 // so the trace and the numbers stay live while the alarm is up.
-void serviceAlarmView(const ReadingSnapshot& reading){
+void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool stale){
   const HoldResult hold=holdUpdate(g_hold,g_touchDown,g_touchX,g_touchY,millis(),
                                    HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
 
@@ -957,14 +957,22 @@ void serviceAlarmView(const ReadingSnapshot& reading){
   a.elapsedS = g_selfTest ? 0 : alarmElapsedS(g_alarm,nowE);
   a.selfTest=g_selfTest;
   a.selfTestLeftS=static_cast<int>(SELFTEST_DURATION_S-(millis()-g_selfTestStart)/1000);
+  a.stale=stale; a.radioState=radioState;
 
   // Three independent repaints, so the fastest-changing thing does not drag the slowest through
   // a redraw: the vitals and trace only when a new reading lands (~20 s), the timer once a
   // second in its own corner, the frame twice a second as six thin rectangles.
-  const int key = reading.sequence*7 + reading.heartRate + reading.oxygenSaturation*3;
+  const int key = reading.sequence*7 + reading.heartRate + reading.oxygenSaturation*3
+                  + (stale?9001:0) + static_cast<int>(radioState)*37;
   if(!g_alarmKeyValid || key!=g_alarmKey){
     g_alarmKey=key; g_alarmKeyValid=true;
     drawAlarmStatic(a); drawAlarmTimer(a); drawAlarmHold(hold,g_selfTest);
+    // Evidence for "the trace looks frozen": prints once per repaint, so the interval between
+    // lines is the real reading cadence and hist/timed say whether the trace has a time axis.
+    Serial.printf("[alarm] draw hr=%d spo2=%d seq=%d hist=%d timed=%d age=%lus\n",
+                  reading.heartRate,reading.oxygenSaturation,reading.sequence,histCnt,
+                  tracePositional(histEpoch,histCnt)?0:1,
+                  (unsigned long)(reading.lastPacketMs?(millis()-reading.lastPacketMs)/1000:0));
   }
 
   static uint32_t lastTimerS=0xFFFFFFFF;
@@ -1048,9 +1056,9 @@ void loop(){
   // ---- critical alarm ----
   // Driven every pass, before rendering, so the alarm can take the screen in the same pass it
   // fires rather than a frame later.
+  const bool stale = reading.lastPacketMs==0 ||
+                     static_cast<uint32_t>(millis()-reading.lastPacketMs)>STALE_MS;
   {
-    const bool stale = reading.lastPacketMs==0 ||
-                       static_cast<uint32_t>(millis()-reading.lastPacketMs)>STALE_MS;
     static int lastAlarmSeq=-1;
     if(reading.sequence!=lastAlarmSeq && reading.lastPacketMs!=0 &&
        static_cast<uint32_t>(millis()-reading.lastPacketMs)<3000){
@@ -1066,7 +1074,7 @@ void loop(){
   }
 
   if(view==ALARM || g_selfTest){
-    serviceAlarmView(reading);
+    serviceAlarmView(reading,radioState,stale);
     // Fall through to logging below so the CSV and the trace keep filling behind the alarm.
   }
   else if(view==LIVE && !holdingHeart) renderLive(reading,radioState);

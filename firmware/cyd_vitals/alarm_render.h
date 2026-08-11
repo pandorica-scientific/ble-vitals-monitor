@@ -20,11 +20,15 @@
 #define ALARM_GAP    0x39E7
 
 #define ALARM_FRAME_PX 6
+// The trace gives up fourteen pixels so the telephone numbers can be set in a real font rather
+// than Font0. At three in the morning the numbers have to be readable at arm's length by someone
+// who has just woken up; the trace only has to show a shape.
 #define ALARM_TRACE_Y  78
-#define ALARM_TRACE_H  84
-#define ALARM_HOLD_Y   178
-#define ALARM_HOLD_H   26
-#define ALARM_CONTACT_Y 208
+#define ALARM_TRACE_H  70
+#define ALARM_HOLD_Y   160
+#define ALARM_HOLD_H   24
+#define ALARM_CONTACT_Y 188
+#define ALARM_CONTACT_DY 20
 #define ALARM_TIMER_W    66   // room for "59:59" at FreeSansBold9pt7b, and no more
 
 struct AlarmAppearance {
@@ -36,6 +40,8 @@ struct AlarmAppearance {
   uint32_t elapsedS = 0;
   bool selfTest = false;
   int selfTestLeftS = 0;
+  bool stale = false;                            // no packet within STALE_MS
+  RadioState radioState = RadioState::RECEIVING;
 };
 
 // Only the perimeter flashes. A flashing background makes the telephone numbers and the trace
@@ -106,22 +112,38 @@ inline void drawAlarmStatic(const AlarmAppearance& a){
 
   char hr[12];
   // The byte cannot express more than 255, so at the rail the true rate is unknown and at least
-  // this high. Saying ">=255" is honest; printing 255 is not.
-  if(a.heartRate>=HR_RAIL) snprintf(hr,sizeof(hr),">=255");
+  // this high. Saying ">=255" is honest; printing 255 is not. A stale reading is shown as "--"
+  // for the same reason: a number frozen ten minutes ago is not a measurement, and on this screen
+  // above all it must not look like one.
+  if(a.stale)              snprintf(hr,sizeof(hr),"--");
+  else if(a.heartRate>=HR_RAIL) snprintf(hr,sizeof(hr),">=255");
   else if(a.heartRate<=0)  snprintf(hr,sizeof(hr),"--");
   else snprintf(hr,sizeof(hr),"%d",a.heartRate);
   tft.setFont(&fonts::FreeSansBold12pt7b); tft.setTextColor(ALARM_RED);
   tft.setTextDatum(textdatum_t::top_left); tft.drawString(hr,10,34);
 
-  tft.setFont(&fonts::Font0); tft.setTextColor(DIM);
-  tft.setTextDatum(textdatum_t::top_left); tft.drawString("bpm",10,62);
-  char pk[20]; snprintf(pk,sizeof(pk),"peak %d",a.machine?a.machine->peak:0);
-  tft.drawString(pk,46,62);
+  // The unit label doubles as the radio indicator. Without it a wristband dropout - which happens
+  // whenever the baby moves - looks identical to a frozen screen, and this is the one screen where
+  // "no data" must never be mistakable for "data that is not changing".
+  const char* unit = "bpm";
+  bool warn = false;
+  switch(a.radioState){
+    case RadioState::RECEIVING:      unit = a.stale ? "NO DATA" : "bpm"; warn = a.stale; break;
+    case RadioState::STARTING:       unit = "scan";        warn = true;  break;
+    case RadioState::BAND_MISSING:   unit = "NO BAND";     warn = true;  break;
+    case RadioState::SCANNER_SILENT: unit = "RADIO RETRY"; warn = true;  break;
+  }
+  tft.setFont(&fonts::Font0); tft.setTextColor(warn?ALARM_RED:DIM);
+  tft.setTextDatum(textdatum_t::top_left); tft.drawString(unit,10,62);
+  if(!warn){
+    char pk[20]; snprintf(pk,sizeof(pk),"peak %d",a.machine?a.machine->peak:0);
+    tft.setTextColor(DIM); tft.drawString(pk,46,62);
+  }
 
   char sp[28];
   // Oxygen commits about every fifteen minutes, so the value beside a live heart rate may be a
   // quarter of an hour old. Without its age someone reads a stale number down the telephone.
-  if(a.oxygen<=0) snprintf(sp,sizeof(sp),"SpO2 --");
+  if(a.stale || a.oxygen<=0) snprintf(sp,sizeof(sp),"SpO2 --");
   else if(a.oxygenAgeMin<0) snprintf(sp,sizeof(sp),"SpO2 %d%%",a.oxygen);
   else snprintf(sp,sizeof(sp),"SpO2 %d%% - %dm ago",a.oxygen,a.oxygenAgeMin);
   tft.setTextColor(a.oxygenAgeMin>=SPO2_STALE_MIN?DIM:ALARM_TEXT);
@@ -130,9 +152,10 @@ inline void drawAlarmStatic(const AlarmAppearance& a){
   drawAlarmTrace(10,ALARM_TRACE_Y,W-20,ALARM_TRACE_H,a.elapsedS);
 
   if(a.contacts && a.contacts->count>0){
-    tft.setFont(&fonts::Font0); tft.setTextColor(ALARM_TEXT);
+    tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(ALARM_TEXT);
     tft.setTextDatum(textdatum_t::top_center);
-    for(int i=0;i<a.contacts->count;i++) tft.drawString(a.contacts->line[i],W/2,ALARM_CONTACT_Y+i*11);
+    for(int i=0;i<a.contacts->count;i++)
+      tft.drawString(a.contacts->line[i],W/2,ALARM_CONTACT_Y+i*ALARM_CONTACT_DY);
   }
 }
 
