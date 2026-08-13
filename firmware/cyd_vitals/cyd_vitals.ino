@@ -5,10 +5,10 @@
 //   yellow/red warning lines. Tap a column -> 24h avg±std chart (tap cycles 1h/30m/15m;
 //   auto-returns to live after 10 s of no touch).
 // Also: WiFi+NTP clock (Europe/Warsaw) synced once at boot then reboots BLE-only (coexistence),
-//   per-reading CSV logging to microSD (one file per day), and a backlight that drops to its
-//   lowest step between 20:00 and 08:00 so it doesn't light up the room at night.
-// Power: use a stable regulated 5 V supply. The BLE scan is duty-cycled and the daytime
-//   backlight runs below full to avoid unnecessary work and heat (see SCAN_* and BRIGHT_DAY).
+//   per-reading CSV logging to microSD (one file per day), and a backlight that fades to about a
+//   tenth of full over an hour from sunset so it doesn't light up the room at night (day_night.h).
+// Power: use a stable regulated 5 V supply. Both the radio and the backlight now run continuously
+//   at full by day, which is deliberate - see the powerbank note at SCAN_INTERVAL_MS.
 // Export: swipe UP on the live view and the board becomes its own WiFi access point serving the
 //   logged CSVs to a phone, so a week or a month can be pulled anywhere without removing the SD
 //   card. Swipe DOWN (or wait out the timeout) to resume. Monitoring is PAUSED while it is up.
@@ -39,6 +39,7 @@
 #include "hold_gesture.h"
 #include "alert_log.h"
 #include "contacts.h"
+#include "day_night.h"     // solar dimming schedule and the backlight ramp
 #include "app_html.h"      // the report page served in export mode (PROGMEM)
 
 #define ROTATION 0
@@ -66,14 +67,11 @@
 // A three-second hold ends it early, so it never traps the screen.
 #define SELFTEST_DURATION_S  60   // how long the test alarm runs before returning by itself
 #define SPO2_STALE_MIN       20   // minutes after which the oxygen reading is greyed
-// backlight: dim overnight so the display doesn't light up the room
-#define NIGHT_START_MIN (20*60)   // 20:00 -> dim
-#define NIGHT_END_MIN   (8*60)    // 08:00 -> full
+// backlight: dim overnight so the display doesn't light up the room. The schedule follows sunset
+// and sunrise for this location rather than two fixed times, and both edges fade over an hour
+// instead of stepping; the levels, clamps and solar maths all live in day_night.h.
 #define FORCE_NIGHT 0             // test aid: set to 1 to force night mode regardless of the clock,
-                                  // so the dark theme can be checked without waiting for 20:00
-#define BRIGHT_DAY   140          // ~55%: backlight current tracks PWM duty closely, so this is
-                                  // about half the power of 255 and still easily readable indoors
-#define BRIGHT_NIGHT 1            // lowest non-zero PWM step (0 would switch the backlight off)
+                                  // so the dark theme can be checked without waiting for sunset
 // BLE scan duty cycle. Receiving costs ~90-100 mA.
 // MEASURED on this board with the display and SD logging running - reception falls off much faster
 // than the duty ratio suggests, because rendering and SD writes compete with the radio:
@@ -539,15 +537,50 @@ void logBoot(){
 }
 bool nowHM(char* o){ struct tm tm{}; if(!readLocalClock(tm))return false; strftime(o,8,"%H:%M",&tm); return true; }
 int minuteOfDay(){ struct tm tm{}; if(!readLocalClock(tm))return -1; return tm.tm_hour*60+tm.tm_min; }
-// 20:00 -> 08:00 is "night": dim backlight + dark theme.
-// Gated on g_timeReady: without a valid clock the day look is the safe default.
+// The night window moves once a day, and the render loop asks about it every 30 s, so it is
+// computed on the first call of each new date and cached. tm_gmtoff carries whatever offset the
+// configured timezone has in effect that day, so the March and October changeovers need no special
+// case here - the window simply shifts with the clocks.
+NightWindow currentNightWindow(const struct tm& local, time_t nowT){
+  static NightWindow cached;
+  static int cachedYday=-1, cachedYear=-1;
+  if(local.tm_yday!=cachedYday || local.tm_year!=cachedYear){
+    struct tm utc{}; gmtime_r(&nowT,&utc);
+    cached=nightWindowFor(solarTimesForDay(local.tm_year+1900, local.tm_yday,
+                                           SITE_LATITUDE_DEG, SITE_LONGITUDE_DEG,
+                                           utcOffsetMinutes(local,utc)));
+    cachedYday=local.tm_yday; cachedYear=local.tm_year;
+  }
+  return cached;
+}
+// The theme and the backlight need the same two facts - where we are in the local day, and which
+// night window that day has - so they are read together and can never disagree.
+bool localDayState(int& minuteOut, NightWindow& windowOut){
+  time_t now; time(&now);
+  struct tm local{}; localtime_r(&now,&local);
+  if(local.tm_year<=120) return false;               // clock not set yet
+  minuteOut=local.tm_hour*60+local.tm_min;
+  windowOut=currentNightWindow(local,now);
+  return true;
+}
+// "Night" here means the dark theme, which cannot fade and so flips in one step, at the moment the
+// backlight starts fading down. Gated on g_timeReady: without a valid clock the day look is the
+// safe default.
 bool isNight(){
   if(FORCE_NIGHT) return true;
   if(!g_timeReady) return false;
-  int m=minuteOfDay();
-  return m>=0 && (m>=NIGHT_START_MIN || m<NIGHT_END_MIN);
+  int m; NightWindow w;
+  if(!localDayState(m,w)) return false;
+  return isNightAt(m,w);
 }
-int wantBrightness(){ return isNight()?BRIGHT_NIGHT:BRIGHT_DAY; }
+// Backlight level, ramped across both edges rather than stepped. Same fallback as isNight(): an
+// unknown clock means full brightness, never a dark screen nobody asked for.
+int wantBrightness(){
+  if(FORCE_NIGHT) return BRIGHT_NIGHT_LEVEL;
+  int m; NightWindow w;
+  if(!g_timeReady || !localDayState(m,w)) return BRIGHT_DAY_LEVEL;
+  return brightnessAt(m,w);
+}
 void setBacklight(int want){                     // single owner of the PWM; only writes on a change
   static int cur=-1; if(want!=cur){ tft.setBrightness(want); cur=want; }
 }
@@ -841,7 +874,7 @@ void enterExport(){
   g_http->on("/days",handleDays);
   g_http->onNotFound(handleFile);
   g_http->begin();
-  setBacklight(BRIGHT_DAY);                      // the credentials have to be readable at night too
+  setBacklight(BRIGHT_DAY_LEVEL);                // the credentials have to be readable at night too
   drawExportStatic(); drawExportCountdown();
   Serial.printf("[export] AP=%s ip=%s\n",AP_SSID,WiFi.softAPIP().toString().c_str());
 }
@@ -890,7 +923,7 @@ void setup(){
   pinMode(T_MISO,INPUT); pinMode(T_IRQ,INPUT); digitalWrite(T_CS,HIGH); digitalWrite(T_CLK,LOW);
   tft.init();
   for(int r=0;r<4;r++){ tft.setRotation(r); tft.fillScreen(BG); }
-  tft.setRotation(ROTATION); tft.setBrightness(BRIGHT_DAY);   // daytime level until the clock is known
+  tft.setRotation(ROTATION); tft.setBrightness(BRIGHT_DAY_LEVEL);   // daytime level until the clock is known
   W=tft.width(); H=tft.height(); HDR=28; COLW=W/2; RH=(H-HDR)/2;
   setenv("TZ",TZ_INFO,1); tzset();   // re-apply TZ each boot (survives via env, not the reboot)
   bootMsg("SD card..."); initSD();

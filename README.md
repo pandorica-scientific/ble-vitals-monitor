@@ -186,13 +186,27 @@ full-screen 0:00→24:00 plot showing the **average ± standard deviation** per 
 plot to cycle the bin size **1 h → 30 min → 15 min**; it **auto-returns to the live view after
 10 s** of no touch. On boot the firmware reloads the day's CSV so charts survive a power cycle.
 
-**Night mode** — **between 20:00 and 08:00** the backlight drops to its lowest step and the display
-switches to a **dark theme**: background and the grey chrome (labels, name, clock, separators, chart
-grid) flip to their inverse, while the HEART / OXYGEN / temperature colours stay exactly as they are
-during the day. Change the window, the brightness levels or the palette with `NIGHT_START_MIN` /
-`NIGHT_END_MIN` / `BRIGHT_NIGHT` and the `*_D` colour constants at the top of `cyd_vitals.ino`; set
-`FORCE_NIGHT 1` to check the dark theme without waiting until 20:00. Until the clock is set the
-display stays in the daytime look.
+**Night mode** — the schedule follows **sunset and sunrise** for the configured location rather than
+two fixed clock times, so it tracks the seasons without anyone editing constants twice a year. From
+the night edge the backlight **fades over an hour** from full to about a tenth, and mirrors that
+fade over the hour after the morning edge. The display also switches to a **dark theme**: background
+and the grey chrome (labels, name, clock, separators, chart grid) flip to their inverse, while the
+HEART / OXYGEN / temperature colours stay exactly as they are during the day. The theme cannot fade,
+so it flips in one step where the evening fade begins.
+
+Pure solar times are wrong at the solstices — at this latitude the sun rises at 04:14 in late June,
+and a monitor that jumps to full brightness then is a defect — so the solar result is **clamped**:
+dimming never starts before 19:00 or after 21:00, and brightening never starts before 07:00. In
+practice sunset drives the evening edge through spring and autumn and the clamp holds it at the
+solstices, while sunrise drives the morning edge for roughly the winter half of the year.
+
+Everything tunable lives in `firmware/cyd_vitals/day_night.h`: `SITE_LATITUDE_DEG` /
+`SITE_LONGITUDE_DEG` (currently Warsaw), the three clamp constants, `BRIGHT_DAY_LEVEL` /
+`BRIGHT_NIGHT_LEVEL`, and `BRIGHT_RAMP_MIN` for the fade length. The palette is the `*_D` colour
+constants in `cyd_vitals.ino`; set `FORCE_NIGHT 1` there to check the dark theme without waiting for
+sunset. Until the clock is set the display stays in the daytime look. No network is involved — the
+solar maths runs on-device from the date and the timezone offset already in effect, so daylight
+saving needs no special handling.
 
 ### Critical heart-rate alarm
 
@@ -280,9 +294,10 @@ above it are the radio and the backlight.
 
 | Setting | Why it is where it is |
 |---|---|
-| `SCAN_INTERVAL_MS 1000` / `SCAN_WINDOW_MS 500` | Receiving costs ~90–100 mA and the old 99 %-duty scan dominated the budget for no benefit — the wristband advertises every ~1.5 s and only produces a new heart rate every ~20 s. 50 % is as low as this board goes reliably; see the measurements below. |
-| `BRIGHT_DAY 140` | Backlight current tracks the PWM duty closely, so this is about half the power of full brightness and still easily readable indoors. |
-| `BRIGHT_NIGHT 1` | Lowest non-zero step. `0` switches the backlight off entirely. |
+| `SCAN_INTERVAL_MS 100` / `SCAN_WINDOW_MS 100` | Continuous scan. Not for more data — the ceiling is one new measurement per ~14–20 s however hard we listen — but because this runs from a powerbank, and many powerbanks switch themselves off when the load drops below a minimum threshold. A receiver that never sleeps keeps the draw above that floor. It also buys frame-loss margin; see the measurements below. |
+| `BRIGHT_DAY_LEVEL 255` | Full brightness by day. Backlight current tracks the PWM duty closely, so this costs more than the old 140 — deliberate, for the same powerbank reason as the scan duty. |
+| `BRIGHT_NIGHT_LEVEL 26` | About a tenth of full: readable across a dark room at a glance without lighting it up. |
+| `BRIGHT_RAMP_MIN 60` | The fade spans an hour at both edges. The render loop refreshes the backlight every 30 s, so that is ~120 steps of ~2 PWM levels — below the threshold where a change reads as a flicker. |
 
 **Don't lower `SCAN_WINDOW_MS` without re-measuring.** Reception degrades much faster than the duty
 ratio suggests, because rendering and SD writes compete with the radio. Worst gap between decoded

@@ -7,6 +7,7 @@
 #include "../firmware/cyd_vitals/live_render_key.h"
 #include "../firmware/cyd_vitals/radio_health.h"
 #include "../firmware/cyd_vitals/wifi_failover.h"
+#include "../firmware/cyd_vitals/day_night.h"
 
 #include <cmath>
 #include <cstdint>
@@ -571,7 +572,181 @@ static void testContacts() {
   }
 }
 
+// Zero-based day of year, matching struct tm.tm_yday, for the 2026 dates used below.
+static constexpr int YDAY_MAR20 = 78;
+static constexpr int YDAY_MAR29 = 87;
+static constexpr int YDAY_JUN21 = 171;
+static constexpr int YDAY_SEP23 = 265;
+static constexpr int YDAY_DEC21 = 354;
+
+static constexpr int CET = 60;    // winter, UTC+1
+static constexpr int CEST = 120;  // summer, UTC+2
+
+static SolarTimes warsaw(int yday, int utcOffsetMin) {
+  return solarTimesForDay(2026, yday, SITE_LATITUDE_DEG, SITE_LONGITUDE_DEG, utcOffsetMin);
+}
+
+static void expectNear(int actual, int expected, int tolerance, const char* message) {
+  const int delta = actual > expected ? actual - expected : expected - actual;
+  if (delta > tolerance) {
+    std::fprintf(stderr, "FAIL: %s (got %02d:%02d, expected %02d:%02d)\n", message, actual / 60,
+                 actual % 60, expected / 60, expected % 60);
+    ++failures;
+  }
+}
+
+static void testSolarTimes() {
+  // Published Warsaw sunrise/sunset, to the minute. Three minutes of slack covers the difference
+  // between the reference site's rounding and ours; the algorithm is good to well under that.
+  {
+    SolarTimes s = warsaw(YDAY_JUN21, CEST);
+    expect(s.valid, "midsummer has both a sunrise and a sunset");
+    expectNear(s.sunriseMin, 4 * 60 + 14, 3, "21 June sunrise is 04:14 CEST");
+    expectNear(s.sunsetMin, 21 * 60 + 1, 3, "21 June sunset is 21:01 CEST");
+  }
+  {
+    SolarTimes s = warsaw(YDAY_DEC21, CET);
+    expectNear(s.sunriseMin, 7 * 60 + 44, 3, "21 December sunrise is 07:44 CET");
+    expectNear(s.sunsetMin, 15 * 60 + 25, 3, "21 December sunset is 15:25 CET");
+  }
+  {
+    SolarTimes s = warsaw(YDAY_MAR20, CET);
+    expectNear(s.sunriseMin, 5 * 60 + 41, 3, "20 March sunrise is 05:41 CET");
+    expectNear(s.sunsetMin, 17 * 60 + 49, 3, "20 March sunset is 17:49 CET");
+  }
+  {
+    SolarTimes s = warsaw(YDAY_SEP23, CEST);
+    expectNear(s.sunriseMin, 6 * 60 + 24, 3, "23 September sunrise is 06:24 CEST");
+    expectNear(s.sunsetMin, 18 * 60 + 35, 3, "23 September sunset is 18:35 CEST");
+  }
+
+  // The clocks going forward must move the reported local times by exactly the offset change and
+  // nothing else - this is the whole reason the offset is passed in rather than hardcoded.
+  {
+    SolarTimes winter = warsaw(YDAY_MAR29, CET);
+    SolarTimes summer = warsaw(YDAY_MAR29, CEST);
+    expect(summer.sunriseMin - winter.sunriseMin == 60, "DST shifts sunrise by exactly an hour");
+    expect(summer.sunsetMin - winter.sunsetMin == 60, "DST shifts sunset by exactly an hour");
+  }
+
+  // Above the Arctic Circle in midsummer the sun never sets and the equation has no solution.
+  {
+    SolarTimes s = solarTimesForDay(2026, YDAY_JUN21, 78.2, 15.6, CEST);
+    expect(!s.valid, "polar day yields no sunrise or sunset");
+  }
+}
+
+// The offset is recovered from two breakdowns of one instant because the ESP32 has no tm_gmtoff.
+// The cases that matter are the ones where local and UTC land on different dates.
+static void testUtcOffsetRecovery() {
+  auto at = [](int year, int yday, int hour, int min) {
+    struct tm t{};
+    t.tm_year = year - 1900;
+    t.tm_yday = yday;
+    t.tm_hour = hour;
+    t.tm_min = min;
+    return t;
+  };
+
+  // 21 June, 12:00 UTC is 14:00 CEST on the same day.
+  expect(utcOffsetMinutes(at(2026, YDAY_JUN21, 14, 0), at(2026, YDAY_JUN21, 12, 0)) == CEST,
+         "a same-day comparison gives the summer offset");
+  // 21 December, 12:00 UTC is 13:00 CET.
+  expect(utcOffsetMinutes(at(2026, YDAY_DEC21, 13, 0), at(2026, YDAY_DEC21, 12, 0)) == CET,
+         "a same-day comparison gives the winter offset");
+  // 23:30 UTC is 01:30 CEST the following morning - local is a day ahead.
+  expect(utcOffsetMinutes(at(2026, YDAY_JUN21 + 1, 1, 30), at(2026, YDAY_JUN21, 23, 30)) == CEST,
+         "local running a day ahead still gives a positive offset");
+  // New Year's Eve in UTC, New Year's Day locally.
+  expect(utcOffsetMinutes(at(2027, 0, 0, 0), at(2026, 364, 23, 0)) == CET,
+         "a comparison across the year boundary gives the winter offset");
+  // The mirror case: a western zone whose local date lags UTC.
+  expect(utcOffsetMinutes(at(2026, YDAY_JUN21, 20, 0), at(2026, YDAY_JUN21 + 1, 1, 0)) == -300,
+         "local running a day behind gives a negative offset");
+}
+
+static void testNightWindow() {
+  // Midsummer: sunset 21:02 is past the latest permitted start, sunrise 04:14 is long before the
+  // earliest permitted end. Both clamp, which is exactly the 04:14 wake-up this guards against.
+  {
+    NightWindow w = nightWindowFor(warsaw(YDAY_JUN21, CEST));
+    expect(w.startMin == NIGHT_START_LATEST_MIN, "midsummer dimming is held back to 21:00");
+    expect(w.endMin == NIGHT_END_EARLIEST_MIN, "midsummer brightening is held back to 07:00");
+  }
+  // Midwinter: sunset 15:25 would dim the screen mid-afternoon, so it clamps; sunrise 07:44 is
+  // after the earliest permitted end, so the solar time is used unchanged.
+  {
+    NightWindow w = nightWindowFor(warsaw(YDAY_DEC21, CET));
+    expect(w.startMin == NIGHT_START_EARLIEST_MIN, "midwinter dimming is held off until 19:00");
+    expectNear(w.endMin, 7 * 60 + 44, 3, "midwinter brightening follows the late sunrise");
+  }
+  // A window that cannot be computed must still be usable and must not dim early.
+  {
+    SolarTimes invalid{};
+    NightWindow w = nightWindowFor(invalid);
+    expect(w.startMin == NIGHT_START_LATEST_MIN && w.endMin == NIGHT_END_EARLIEST_MIN,
+           "an unusable solar result falls back to the conservative window");
+  }
+}
+
+static void testNightWindowWrapsMidnight() {
+  NightWindow w{21 * 60, 7 * 60};
+  expect(!isNightAt(20 * 60 + 59, w), "a minute before the start is still day");
+  expect(isNightAt(21 * 60, w), "the start minute is night");
+  expect(isNightAt(23 * 60 + 59, w), "late evening is night");
+  expect(isNightAt(0, w), "midnight is night");
+  expect(isNightAt(3 * 60, w), "the small hours are night");
+  expect(isNightAt(6 * 60 + 59, w), "a minute before the end is still night");
+  expect(!isNightAt(7 * 60, w), "the end minute is day");
+  expect(!isNightAt(12 * 60, w), "midday is day");
+}
+
+static void testBrightnessRamp() {
+  NightWindow w{21 * 60, 7 * 60};
+
+  expect(brightnessAt(20 * 60, w) == BRIGHT_DAY_LEVEL, "full brightness through the evening");
+  expect(brightnessAt(21 * 60, w) == BRIGHT_DAY_LEVEL, "the fade begins at full brightness");
+  expect(brightnessAt(21 * 60 + 60, w) == BRIGHT_NIGHT_LEVEL, "the fade reaches night level in an hour");
+  expect(brightnessAt(23 * 60, w) == BRIGHT_NIGHT_LEVEL, "it stays at night level afterwards");
+  expect(brightnessAt(3 * 60, w) == BRIGHT_NIGHT_LEVEL, "and through the small hours");
+
+  const int half = brightnessAt(21 * 60 + 30, w);
+  expect(half > BRIGHT_NIGHT_LEVEL && half < BRIGHT_DAY_LEVEL, "halfway down is between the two levels");
+  expectNear(half, (BRIGHT_DAY_LEVEL + BRIGHT_NIGHT_LEVEL) / 2, 2, "halfway down is about halfway");
+
+  // The evening ramp must never brighten, and the morning ramp must never dim. A single step in
+  // the wrong direction would read as a flicker in a dark room.
+  int previous = BRIGHT_DAY_LEVEL + 1;
+  for (int t = 0; t <= 60; ++t) {
+    const int level = brightnessAt((21 * 60 + t) % 1440, w);
+    expect(level <= previous, "the evening ramp never brightens");
+    previous = level;
+  }
+
+  expect(brightnessAt(7 * 60, w) == BRIGHT_NIGHT_LEVEL, "the morning fade begins at night level");
+  expect(brightnessAt(8 * 60, w) == BRIGHT_DAY_LEVEL, "the morning fade reaches full in an hour");
+  expect(brightnessAt(12 * 60, w) == BRIGHT_DAY_LEVEL, "midday is full brightness");
+
+  previous = BRIGHT_NIGHT_LEVEL - 1;
+  for (int t = 0; t <= 60; ++t) {
+    const int level = brightnessAt(7 * 60 + t, w);
+    expect(level >= previous, "the morning ramp never dims");
+    previous = level;
+  }
+
+  // Every minute of the day has to land inside the configured range, wrap included.
+  for (int m = 0; m < 1440; ++m) {
+    const int level = brightnessAt(m, w);
+    expect(level >= BRIGHT_NIGHT_LEVEL && level <= BRIGHT_DAY_LEVEL, "brightness stays in range");
+  }
+}
+
 int main() {
+  testSolarTimes();
+  testUtcOffsetRecovery();
+  testNightWindow();
+  testNightWindowWrapsMidnight();
+  testBrightnessRamp();
   testBandDecoder();
   testReadingMerge();
   testRadioHealth();
