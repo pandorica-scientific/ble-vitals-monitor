@@ -37,9 +37,9 @@ offset  value      field
   6-7   u16 BE     SKIN TEMPERATURE:  skin_C = ((b6<<8)|b7) / 10   (0.1 C resolution)  ★CONFIRMED
   8-9   u16 BE     secondary thermal value (u16 BE / 10); meaning NOT confirmed — do not label
  10     hr         HEART RATE (bpm)                                                    ★CONFIRMED
- 11-12  16-bit     PPG / perfusion signal (pulse-derived)
+ 11-12  u16 BE     INTER-BEAT INTERVAL in milliseconds (beat_ms)                        ★CONFIRMED
  13     spo2       SpO2 (%)                                                            ★CONFIRMED
- 14-15  16-bit     PPG / perfusion signal
+ 14-15  16-bit     pulse-derived; meaning NOT confirmed — do not label
  16-21  MAC        wristband MAC address, little-endian (e.g. 33 05 6C 4E CD F7)
  22     A4         checksum / constant
 ```
@@ -52,6 +52,36 @@ The base's advertisement is a **9-byte identity beacon** only
 - **Heart rate** = `byte[10]` (bpm). Verified: captured values matched the app's HR history
   exactly across the full range (118–148 bpm).
 - **SpO2** = `byte[13]` (%). Verified against the app (96–99%).
+- **Inter-beat interval** = **big-endian `uint16` of bytes 11–12**, in **milliseconds**. So
+  `bpm_from_interval = 60000 / beat_ms`. Established from a 60-minute passive capture
+  (182 measurements, HR 112–167 bpm):
+  - Fitting `beat_ms = k / hr` gives **k = 60208, bootstrap 95% CI [59699, 60716]**. That
+    interval contains exactly **60000** (milliseconds) and **excludes 61440**, which rules out
+    1/1024-second ticks — the only other unit that fit the 10-minute sample.
+  - The two estimates agree on average: mean `byte[10]` = 133.10 bpm, mean `60000/beat_ms` =
+    132.60 bpm. Mean disagreement −0.50 bpm, i.e. unbiased.
+  - **It is not a restatement of `byte[10]`.** Across 32 heart-rate values that recurred during
+    the capture, the interval was constant in **0 of 32** — median spread 52 ms, max 113 ms. A
+    reported 123 bpm carried 16 distinct intervals from 435 to 520 ms.
+  - The two disagree per-measurement (sd 8.7 bpm, 95% limits of agreement −17.6…+16.6 bpm)
+    because they measure different things: averaging `60000/beat_ms` over a wider window moves it
+    steadily toward `byte[10]` (rmse 8.74 → 5.52 → 4.60 → 3.80 bpm over 1/3/5/9 measurements).
+    The consistent reading is that **`byte[10]` is a windowed average and bytes 11–12 are a
+    recent single-beat interval** — so the pair carries beat-to-beat variability that the bpm
+    byte alone does not.
+
+  > A plain OLS fit of `beat_ms` on `60000/hr` returns a slope of 0.83, not 1.0. That is an
+  > errors-in-variables artifact, not evidence against the interval reading: regressing the other
+  > direction gives an implied slope of 1.40, the product of the two slopes is 0.59 (it would be
+  > 1.0 with no scatter), and the geometric-mean slope is 1.08. Both one-directional fits are
+  > attenuated by the scatter over a narrow x-range. The single-parameter scale fit above has no
+  > intercept to trade against and is the estimator to trust.
+
+- **Bytes 14–15**: pulse-derived and varying per measurement (143 distinct values in 182), but
+  the meaning is **not** established. It is not an interval (treating it as one implies ~62 bpm
+  against a true 133). It correlates only weakly and with everything at once — signal-quality
+  byte +0.49, SpO2 +0.42, heart rate +0.43, bytes 11–12 −0.35 — which is what a perfusion or
+  amplitude measure would look like, but that is a guess. Do not label it.
 - **Skin temperature** = **big-endian `uint16` of bytes 6–7, divided by 10** (°C, 0.1° resolution).
   Verified against the app and independent captures:
   - `01 5D` = 0x015D = 349 → **34.9 °C**  (app shows 35)
@@ -78,9 +108,30 @@ advertisement arrived; compare the raw value (and/or watch the flag) instead.
 
 ## Update cadence
 
-- **Heart rate**: new value ~every 20 s (each bumps the byte-2 counter).
+- **Heart rate**: new value ~every 20 s (each bumps the byte-2 counter). Measured over a
+  60-minute capture: median **20.1 s**, range 13.0–26.8 s.
 - **SpO2 / temperature**: the wristband broadcasts continuously, but the cloud/app only
   *commits* a stabilized value ~every 15 min, and skips a commit when the reading is invalid.
+
+### Nothing changes between counter bumps
+
+Across 182 measurements (384 deduplicated frames, 60-minute capture), the number of sequences in
+which **any** field changed while `byte[2]` held steady was **zero** — not heart rate, not the
+beat interval, not SpO2, not the state or signal-quality bytes. Between ticks the band
+re-broadcasts a byte-for-byte identical 23-byte payload roughly every 1.5 s.
+
+The practical consequences, because this question keeps coming back:
+
+- **Scanning harder does not buy more data.** A Mac capture scanning continuously — the 100%-duty
+  case — measured a median inter-frame gap of **1.52 s**, which is simply the band's own
+  advertising period. Receiving every single advertisement still yields one *new* measurement per
+  ~20 s. A higher scan duty cycle buys margin against frame loss, nothing else.
+- **Beat-level PPG is not recoverable.** One frame per ~1.5 s is an effective sample rate of
+  **0.66 Hz**. An infant heart runs 2–3 Hz, so reconstructing a waveform would need >6 Hz. The
+  beat interval in bytes 11–12 is a *value the band computed*, not a waveform we could derive.
+- Deduplicate on `byte[2]` before logging or feeding an alarm. Treating repeated advertisements as
+  repeated readings inflates the sample count ~13× with copies of one number, which will quietly
+  break any logic sized against a per-measurement count.
 
 ## Reception notes
 

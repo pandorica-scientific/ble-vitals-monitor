@@ -74,16 +74,24 @@
 #define BRIGHT_DAY   140          // ~55%: backlight current tracks PWM duty closely, so this is
                                   // about half the power of 255 and still easily readable indoors
 #define BRIGHT_NIGHT 1            // lowest non-zero PWM step (0 would switch the backlight off)
-// BLE scan duty cycle. Receiving costs ~90-100 mA, so the old 99%-duty scan (99/100) dominated the
-// power budget for nothing: the wristband advertises every ~1.5 s and only produces a new heart
-// rate every ~20 s (docs/PROTOCOL.md).
+// BLE scan duty cycle. Receiving costs ~90-100 mA.
 // MEASURED on this board with the display and SD logging running - reception falls off much faster
 // than the duty ratio suggests, because rendering and SD writes compete with the radio:
 //   300/1000 (30%) -> worst gap 13.0 s, ~15 adverts/30 s  - too close to STALE_MS, drops to "--"
-//   500/1000 (50%) -> worst gap  2.0 s, ~29 adverts/30 s  - what we ship
-// Re-measure the worst gap against STALE_MS before lowering the window.
-#define SCAN_INTERVAL_MS 1000     // how often a scan window starts
-#define SCAN_WINDOW_MS   500      // how long the radio listens inside that window
+//   500/1000 (50%) -> worst gap  2.0 s, ~29 adverts/30 s  - previous setting
+//   100/100 (100%) -> continuous; the radio never sleeps
+//
+// Why 100% rather than the cheaper 50%: this runs from a powerbank, and many powerbanks switch
+// themselves off when the load drops below a minimum threshold. A continuously-on receiver keeps
+// the draw above that floor. Mains power was never the constraint; unplanned shutdown was.
+//
+// What it does NOT buy is more data, and no future change should assume otherwise. A Mac capture
+// scanning continuously (the 100%-duty case) measured a median inter-frame gap of 1.52 s - the
+// band's own advertising period - and every frame between measurement-counter bumps carries a
+// byte-for-byte identical payload. The ceiling is one new measurement per ~14-20 s no matter how
+// hard we listen; see docs/PROTOCOL.md. This setting buys frame-loss margin, not resolution.
+#define SCAN_INTERVAL_MS 100      // how often a scan window starts
+#define SCAN_WINDOW_MS   100      // equal to the interval: continuous scan, no gap between windows
 // ---- data export mode: swipe UP from the live view, swipe DOWN to resume ----
 // The board becomes its own WiFi access point and serves the logged CSVs to a phone, so the data
 // can be pulled anywhere (a doctor's office) with no home network, no hotspot and no SD removal.
