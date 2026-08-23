@@ -8,8 +8,8 @@ unusual for a hobby project, and they exist for a specific reason.
 ## Current status: code contributions are paused
 
 **No pull request containing code or documentation will be merged yet.** The Contributor
-Licence Agreement in [`CLA.md`](CLA.md) is drafted but has not been reviewed by a lawyer, and
-two clauses in it are still blank. Merging a contribution before that is settled would create
+Licence Agreement in [`CLA.md`](CLA.md) is complete and drafted for Polish law, but has not
+yet been signed off by a lawyer. Merging a contribution before that is done would create
 exactly the problem the CLA is meant to prevent.
 
 This is not a rejection of your work. It is a queue. If you have something ready, open an

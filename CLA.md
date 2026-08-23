@@ -2,10 +2,6 @@
 
 **Version 1.0**
 
-> **Draft — not yet reviewed by counsel.** Two items marked `[CONFIRM]` below must be
-> settled with a lawyer before this file is used to accept a contribution. Until then,
-> code contributions are not being accepted (see [`CONTRIBUTING.md`](CONTRIBUTING.md)).
-
 Thank you for your interest in contributing to this project (the "Project"), owned by
 Robert Kiewisz (the "Owner").
 
@@ -49,22 +45,93 @@ writing as "Not a Contribution."
 
 You retain ownership of the copyright in Your Contribution.
 
-Subject to the terms of this agreement, You grant to the Owner a perpetual, worldwide,
-non-exclusive, no-charge, royalty-free and irrevocable licence — **with the right to
-sublicense and to transfer** — to reproduce, prepare derivative works of, publicly display,
-publicly perform, distribute and otherwise exploit Your Contribution and such derivative
-works.
+Subject to the terms of this agreement, You grant to the Owner a worldwide, non-exclusive,
+no-charge, royalty-free licence — **with the right to sublicense and to transfer** — to use
+and exploit Your Contribution and works derived from it.
 
 **This licence permits the Owner to distribute Your Contribution, and works derived from it,
 under any licence terms the Owner chooses — including terms different from the Project's
 current licence, and including proprietary or commercial terms.**
 
-To the maximum extent permitted by applicable law, You waive, and agree not to assert
-against the Owner or its licensees, any moral or personal rights in the Contribution that
-would prevent the exercise of the rights granted above. Where such a waiver is not
-permitted, You agree not to exercise those rights in a way that frustrates this agreement.
+### 2.1 Fields of exploitation
 
----
+The licence covers the following fields of exploitation, which the parties agree are known at
+the time this agreement is concluded (Art. 41(2) and 41(4) of the Polish Copyright Act):
+
+**For a Contribution that is a computer program, in the fields listed in Art. 74(4):**
+
+1. permanent or temporary reproduction of the program, in whole or in part, by any means and
+   in any form, including reproduction incidental to its input, display, running,
+   transmission or storage, in source form and in compiled form;
+2. translation, adaptation, rearrangement of the layout, and any other alteration of the
+   program, preserving the rights of the person making those alterations;
+3. dissemination of the program or copies of it, including lending and rental, on tangible
+   media and by transmission over a network.
+
+**For any other Contribution — documentation, text, drawings, photographs, measurement data
+and other non-program material — in the fields listed in Art. 50:**
+
+1. as to recording and reproduction: producing copies by any technique, including printing,
+   reprographic, magnetic-recording and digital techniques;
+2. as to dealing in the original or in copies: placing on the market, lending and rental of
+   the original or of copies;
+3. as to dissemination otherwise than under point 2: public performance, exhibition, display,
+   showing, broadcasting and rebroadcasting, and **making the work publicly available in such
+   a way that anyone may access it at a place and time of their own choosing**.
+
+The licence extends to exploitation in all of the above fields regardless of the licence
+terms the Owner later selects for the Project, including commercial terms.
+
+### 2.2 Dependent rights
+
+You grant the Owner permission to exercise, and to authorise others to exercise, the
+dependent right (*prawo zależne*, Art. 2(2) of the Polish Copyright Act) in derivative works
+of Your Contribution, in the fields of exploitation listed in section 2.1 — that is,
+permission to dispose of and use adaptations, translations and modified versions of Your
+Contribution. Without this permission the Owner could not license modified versions of the
+Project, which is its ordinary operation.
+
+### 2.3 Moral rights
+
+You undertake not to exercise, against the Owner or its licensees, any moral or personal
+rights in the Contribution in a way that would prevent the exercise of the rights granted
+above, and You authorise the Owner to exercise on Your behalf the right to decide on first
+publication and on the manner of attribution. To the maximum extent separately permitted by
+applicable law, You also waive such rights.
+
+*(Under Art. 16 of the Polish Copyright Act moral rights are inalienable and cannot be waived
+— hence an undertaking not to exercise them, rather than a waiver.)*
+
+### 2.4 Duration, termination, and what survives it
+
+The licence is granted **without limitation of time**, and the Owner may exercise it for as
+long as the economic rights in the Contribution subsist.
+
+The parties record their understanding that, under Art. 68(2) of the Polish Copyright Act, a
+licence granted for longer than five years is treated as granted for an indefinite period
+once five years have passed, and that under Art. 68(1) such a licence may then be terminated
+by the licensor. **The parties accept this and do not attempt to exclude it.** Instead:
+
+1. **Notice.** Any termination under Art. 68(1) requires written notice delivered to the
+   Owner, and takes effect **twelve months** after delivery, at the end of the calendar year.
+   This is the contractual notice period contemplated by the opening words of Art. 68(1)
+   (*"jeżeli umowa nie stanowi inaczej"*).
+
+2. **Termination operates only for the future.** Termination does **not** affect, withdraw or
+   invalidate, and the following survive termination permanently:
+   - any copy of the Contribution, or of any work incorporating it, already distributed;
+   - any sublicence already granted by the Owner, and any licence already granted by that
+     sublicensee, whether noncommercial or commercial, and whether or not it is perpetual;
+   - any version of the Project released before termination takes effect, which the Owner and
+     its licensees may continue to reproduce, modify, distribute and exploit in the fields of
+     exploitation listed in section 2.1, without limitation of time;
+   - the patent licence in section 3, and the representations in section 5.
+
+   The sole effect of termination is that the Owner may not include the Contribution in
+   **versions of the Project first released after** termination takes effect.
+
+3. **No claw-back of consideration.** Termination gives rise to no claim for payment,
+   accounting, or the return of any benefit, in either direction.
 
 ## 3. Patent licence
 
@@ -123,15 +190,20 @@ upon for anyone's safety.
 
 ---
 
-## 7. Governing law
+## 7. Governing law and jurisdiction
 
-`[CONFIRM]` This agreement is governed by the laws of **_________________**, excluding its
-conflict-of-law rules. `[CONFIRM]` The courts of **_________________** have exclusive
-jurisdiction over any dispute arising from it.
+This agreement is governed by the law of the **Republic of Poland**, excluding its rules on
+conflict of laws.
 
-*(Settle both with counsel. The Owner's place of residence is the usual choice; note the
-Project's timezone default is Europe/Warsaw while patent advice is being sought in Czechia —
-pick deliberately rather than by accident.)*
+Disputes arising from or connected with this agreement are subject to the exclusive
+jurisdiction of the courts of the Republic of Poland. The parties record that, under Article
+479(90) § 2 of the Polish Code of Civil Procedure, the **District Court in Warsaw (Sąd
+Okręgowy w Warszawie)** is exclusively competent in intellectual-property matters concerning
+computer programs.
+
+Nothing in this section deprives a Contributor who is a consumer of the protection afforded
+by mandatory provisions of the law of their country of habitual residence, or of any forum
+available to them under Regulation (EU) No 1215/2012.
 
 If any provision of this agreement is held unenforceable, the remaining provisions stay in
 force, and the unenforceable provision is replaced by an enforceable one that comes closest
