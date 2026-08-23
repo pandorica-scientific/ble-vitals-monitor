@@ -12,7 +12,18 @@ Robert Kiewisz (the "Owner").
 This agreement exists for one reason: so the Owner can keep changing the Project's licence
 in the future — including offering it under commercial terms — without having to track down
 and obtain permission from every past contributor. It does **not** take your copyright away.
-You keep it, and you keep every right to use your own contribution however you like.
+You keep it, and you keep every right to use **the code you yourself wrote** however you
+like — elsewhere, under any licence, in your own products.
+
+**What this agreement does not do:**
+
+- It does **not** give You, or any third party, any right over the rest of the Project. What
+  anyone other than the Owner may do with the Project is set solely by [`LICENSE`](LICENSE)
+  (PolyForm Noncommercial 1.0.0), which permits noncommercial purposes only.
+- It grants rights to **the Owner alone**. It is an agreement between You and the Owner; no
+  third party is a party to it and none acquires rights under it.
+- Submitting a Contribution does **not** enlarge what You may do with the Project. You keep
+  your own work; you gain nothing over anyone else's.
 
 By submitting a Contribution to the Project, You accept and agree to the terms below for
 past, present and future Contributions You submit.
@@ -60,9 +71,10 @@ permitted, You agree not to exercise those rights in a way that frustrates this 
 You grant to the Owner and to recipients of software distributed by the Owner a perpetual,
 worldwide, non-exclusive, no-charge, royalty-free and irrevocable (except as stated below)
 patent licence to make, have made, use, offer to sell, sell, import and otherwise transfer
-Your Contribution, where such licence applies only to those patent claims licensable by You
-that are necessarily infringed by Your Contribution alone or by combination of Your
-Contribution with the Project.
+Your Contribution. This licence is **exercisable only to the extent that the exercise is
+itself permitted by the licence terms under which the Owner distributed the Contribution**,
+and applies only to those patent claims licensable by You that are necessarily infringed by
+Your Contribution alone or by combination of Your Contribution with the Project.
 
 If any entity institutes patent litigation against You or any other entity alleging that
 Your Contribution, or the Project to which You contributed, constitutes direct or
