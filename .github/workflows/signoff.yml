@@ -1,0 +1,61 @@
+name: Sign-off
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  check-signoff:
+    name: Every commit is signed off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request range
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Verify Signed-off-by on each commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          failed=0
+          commits=$(git rev-list "$BASE_SHA".."$HEAD_SHA")
+          if [ -z "$commits" ]; then
+            echo "No commits to check."
+            exit 0
+          fi
+          for sha in $commits; do
+            if [ "$(git rev-list --parents -n 1 "$sha" | wc -w)" -gt 2 ]; then
+              echo "skip   $sha (merge commit)"
+              continue
+            fi
+            author="$(git log -1 --format='%an <%ae>' "$sha")"
+            if git log -1 --format='%B' "$sha" | grep -qiF "Signed-off-by: $author"; then
+              echo "ok     $sha  $author"
+            else
+              echo "MISSING $sha  expected: Signed-off-by: $author"
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            cat <<'MSG'
+
+          One or more commits are missing a Signed-off-by line matching their author.
+
+          Fix the whole branch with:
+              git rebase --signoff origin/main
+              git push --force-with-lease
+
+          The sign-off is your per-commit confirmation of the representations in CLA.md
+          section 5. It does not replace the CLA itself, which must be agreed to in a
+          comment on this pull request. See CONTRIBUTING.md.
+          MSG
+            exit 1
+          fi
+          echo "All commits signed off."

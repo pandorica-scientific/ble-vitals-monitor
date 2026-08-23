@@ -26,3 +26,29 @@ mac/babysensor_reader
 # local scratch (see global preferences)
 scratch-workspace/
 /docs/superpowers
+
+# ---------------------------------------------------------------------------
+# Unpublished hardware work — must NEVER land in this public repository.
+# Optical geometry, wavelength handling, PPG pipelines and sensor fusion are
+# the only potentially patentable material in this project and have not been
+# published. Publishing them here creates prior art against you on day one.
+# They belong in a private repository until patent advice says otherwise.
+# See "Hardware, optics, and sensor work" in CONTRIBUTING.md.
+# ---------------------------------------------------------------------------
+bracelet/
+wearable/
+hardware/
+optics/
+sensor-fusion/
+ppg/
+**/ppg_capture*
+**/analyze_ppg*
+*.kicad_pcb
+*.kicad_sch
+*.kicad_pro
+*.sch
+*.brd
+*.step
+*.stp
+*.f3d
+*.FCStd

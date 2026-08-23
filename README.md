@@ -419,6 +419,22 @@ docs/
 
 ---
 
+## Contributing
+
+**Code and documentation pull requests are paused.** Bug reports, protocol observations from
+your own hardware, and build reports are very welcome — open an issue.
+
+Once contributions reopen they will require agreement to the
+[Contributor Licence Agreement](CLA.md) and a `Signed-off-by` line on every commit. You keep
+your copyright; the agreement exists so the project's licence can still be changed later
+without hunting down every past contributor. A DCO sign-off alone would not achieve that.
+
+Please do not send optical geometry, wavelength handling, PPG pipeline design, sensor-fusion
+design, schematics, or wearable mechanical design to this repository — that material is
+deliberately unpublished. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening anything.
+
+---
+
 ## License & trademarks
 
 Code and documentation: [PolyForm Noncommercial 1.0.0](LICENSE). Provided as-is, with no
