@@ -17,7 +17,7 @@ build/
 *.hex
 # compiled Mac tools (from `swiftc -o`)
 mac/passive_scan
-mac/babysensor_reader
+mac/vitals_reader
 *.dSYM/
 
 # OS cruft

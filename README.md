@@ -381,8 +381,8 @@ quick per-column summary of a capture/log.
 Built and run with the system Swift toolchain (macOS, CoreBluetooth):
 
 ```bash
-swiftc -O mac/babysensor_reader.swift -o babysensor_reader
-./babysensor_reader           # live: HR | SpO2 | skin | signal | RSSI
+swiftc -O mac/vitals_reader.swift -o vitals_reader
+./vitals_reader               # live: HR | SpO2 | skin | signal | RSSI
 
 swiftc -O mac/passive_scan.swift -o passive_scan
 ./passive_scan 60             # 60 s raw advertisement survey (reverse-engineering)
@@ -408,7 +408,7 @@ firmware/
   bandsniff/        reception test — confirms a classic ESP32 can hear the wristband
   provision_wifi/   one-time helper to write /wifi.txt to the SD card
 mac/
-  babysensor_reader.swift   live decoded vitals on macOS
+  vitals_reader.swift       live decoded vitals on macOS
   passive_scan.swift        raw BLE advertisement survey
 tools/
   analyze.py        per-byte / per-column analysis of captures & CSV logs

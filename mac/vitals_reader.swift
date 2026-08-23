@@ -1,4 +1,4 @@
-// babysensor_reader.swift — live passive reader for the Baby Sensor Relax wristband.
+// vitals_reader.swift — live passive reader for the Baby Sensor Relax wristband.
 //
 // RECEIVE-ONLY: scans BLE advertisements only. Never connects, writes, or pairs, so it
 // cannot affect the band<->base link. It just decodes what the band already broadcasts.
@@ -16,7 +16,7 @@
 //   b13   SpO2 (%)
 //   b16-21 MAC (little-endian)  b22 checksum/const
 //
-// Usage: ./babysensor_reader [seconds]   (default 3600)
+// Usage: ./vitals_reader [seconds]   (default 3600)
 
 import Foundation
 import CoreBluetooth
