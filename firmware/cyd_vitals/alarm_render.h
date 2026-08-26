@@ -52,16 +52,20 @@ inline void drawAlarmFrame(bool on){
   tft.fillRect(0,0,t,H,c); tft.fillRect(W-t,0,t,H,c);
 }
 
-inline void drawAlarmTrace(int x,int y,int w,int h,uint32_t elapsedS){
+// refHr is the threshold this episode is about, so the dashed line is the one that matters:
+// 200 for a high alarm, 80 for a low one. Drawing the tachycardia line during a bradycardia
+// episode would put the reference at the top of a trace that is falling off the bottom.
+inline void drawAlarmTrace(int x,int y,int w,int h,uint32_t elapsedS,int refHr){
   tft.fillRect(x,y,w,h,TFT_BLACK);
   const uint32_t windowMin = traceWindowMinutes(elapsedS);
   const uint32_t spanS = windowMin*60;
   const int lo=60, hi=260;                    // fixed, so a rising rate cannot look flat
 
-  const int ty = y+h-((HR_CRIT-lo)*h)/(hi-lo);
+  const int ty = y+h-((refHr-lo)*h)/(hi-lo);
   for(int px=x; px<x+w; px+=6) tft.drawFastHLine(px,ty,3,ALARM_DIMRED);
+  char ref[8]; snprintf(ref,sizeof(ref),"%d",refHr);
   tft.setFont(&fonts::Font0); tft.setTextColor(ALARM_DIMRED);
-  tft.setTextDatum(textdatum_t::bottom_right); tft.drawString("200",x+w-2,ty-1);
+  tft.setTextDatum(textdatum_t::bottom_right); tft.drawString(ref,x+w-2,ty-1);
 
   char axis[24];
   tft.setTextColor(DIM); tft.setTextDatum(textdatum_t::top_right);
@@ -108,7 +112,9 @@ inline void drawAlarmStatic(const AlarmAppearance& a){
 
   tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(ALARM_TEXT);
   tft.setTextDatum(textdatum_t::top_left);
-  tft.drawString(a.selfTest ? "TEST - SELF-CHECK" : "HIGH HEART RATE", 10, 10);
+  const bool low = a.machine && a.machine->cause == AlarmCause::CONFIRMED_LOW;
+  tft.drawString(a.selfTest ? "TEST - SELF-CHECK" : (low ? "LOW HEART RATE" : "HIGH HEART RATE"),
+                 10, 10);
 
   char hr[12];
   // The byte cannot express more than 255, so at the rail the true rate is unknown and at least
@@ -136,7 +142,9 @@ inline void drawAlarmStatic(const AlarmAppearance& a){
   tft.setFont(&fonts::Font0); tft.setTextColor(warn?ALARM_RED:DIM);
   tft.setTextDatum(textdatum_t::top_left); tft.drawString(unit,10,62);
   if(!warn){
-    char pk[20]; snprintf(pk,sizeof(pk),"peak %d",a.machine?a.machine->peak:0);
+    // On the low side the extreme of the episode is its slowest reading, so calling it a peak
+    // would read as the opposite of what happened.
+    char pk[20]; snprintf(pk,sizeof(pk),"%s %d",low?"low":"peak",a.machine?a.machine->peak:0);
     tft.setTextColor(DIM); tft.drawString(pk,46,62);
   }
 
@@ -149,7 +157,7 @@ inline void drawAlarmStatic(const AlarmAppearance& a){
   tft.setTextColor(a.oxygenAgeMin>=SPO2_STALE_MIN?DIM:ALARM_TEXT);
   tft.setTextDatum(textdatum_t::top_right); tft.drawString(sp,W-10,62);
 
-  drawAlarmTrace(10,ALARM_TRACE_Y,W-20,ALARM_TRACE_H,a.elapsedS);
+  drawAlarmTrace(10,ALARM_TRACE_Y,W-20,ALARM_TRACE_H,a.elapsedS,low?HR_CRIT_LOW:HR_CRIT);
 
   if(a.contacts && a.contacts->count>0){
     tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(ALARM_TEXT);

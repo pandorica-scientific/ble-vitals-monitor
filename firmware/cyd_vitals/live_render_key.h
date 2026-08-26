@@ -28,13 +28,15 @@ struct LiveRenderKey {
   RadioState radioState = RadioState::STARTING;
   uint8_t alertMask = ALERT_NONE;
   int minuteKey = -1;
+  bool readingIssue = false;
 };
 
 inline LiveRenderKey makeLiveRenderKey(const ReadingSnapshot& reading, RadioState radioState,
                                        bool stale, uint8_t alertMask, int minuteKey) {
   return {stale, reading.sequence, reading.heartRate, reading.oxygenSaturation,
           reading.signal, static_cast<int>(reading.skinC * 10.0f + 0.5f),
-          reading.skinValid, radioState, alertMask, minuteKey};
+          reading.skinValid, radioState, alertMask, minuteKey,
+          !stale && bandReadingDisagrees(reading.heartRate, reading.beatMs)};
 }
 
 inline bool operator==(const LiveRenderKey& a, const LiveRenderKey& b) {
@@ -42,7 +44,7 @@ inline bool operator==(const LiveRenderKey& a, const LiveRenderKey& b) {
          a.oxygenSaturation == b.oxygenSaturation && a.signal == b.signal &&
          a.skinTenths == b.skinTenths && a.skinValid == b.skinValid &&
          a.radioState == b.radioState && a.alertMask == b.alertMask &&
-         a.minuteKey == b.minuteKey;
+         a.minuteKey == b.minuteKey && a.readingIssue == b.readingIssue;
 }
 
 inline bool operator!=(const LiveRenderKey& a, const LiveRenderKey& b) { return !(a == b); }

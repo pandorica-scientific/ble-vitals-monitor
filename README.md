@@ -211,13 +211,29 @@ saving needs no special handling.
 ### Critical heart-rate alarm
 
 Above the ordinary warning colours there is one alarm that takes the whole screen. It exists for a
-single situation: a **sustained** heart rate at or above **200 bpm**.
+**sustained** heart rate outside the safe band in either direction: at or above **200 bpm**, or at
+or below **80 bpm**.
 
 **What triggers it.** A reading at or above 200 starts a one-minute confirmation window. Any
 reading below 180 during that minute cancels it — the rate came down and nothing happened. At the
 end of the minute the alarm fires if the latest reading is at or above **190** *and* either two
 readings reached 200, **or** the rate stopped falling. That second path matters: `205, 195, 185` is
 a rate coming down and stays quiet, while `205, 185, 195` dipped and came back and does not.
+
+**The slow side is the same machine with the thresholds read the other way up.** A reading at or
+below **80** arms it, anything above **100** cancels it, and it fires if the last reading of the
+minute is at or below **90** and either two readings reached 80 or the rate stopped climbing back.
+One state machine serves both, so there is a single confirmation window, a single latch and a
+single snooze to reason about rather than two that can drift apart. Two differences are deliberate:
+
+- **A heart rate of zero is thrown away before it reaches the slow alarm.** An idle or charging
+  wristband broadcasts zero every couple of seconds, and zero is *no reading*, not a very slow
+  heart. On the fast side this never mattered, because zero is nowhere near 200.
+- **The implausible-collapse rule stays on the fast side only.** Its mirror image — a very slow
+  rate jumping to a very fast one — has no such justification, and against a wristband that will
+  manufacture numbers off bedding it would wake the house for an artifact.
+
+Dismissing silences both sides at once: one hold, one snooze.
 
 Because the minute is counted rather than thrown away, the timer already reads `01:00` when the
 alarm appears. If the rate oscillates either side of 200 the window restarts without cancelling, so
@@ -226,7 +242,8 @@ rather than hidden.
 
 Two things also raise it immediately, without waiting for the window:
 
-- **the signal dies while armed** — silence after a reading at or above 200 is not a drop;
+- **the signal dies while armed** — silence after a reading at or above 200 is not a drop, and
+  silence after one at or below 80 is not a recovery;
 - **an implausible collapse**, a step from 170-plus to 60-or-less, which is either the heart-rate
   byte wrapping past 255 or a genuine emergency. The firmware cannot tell those apart and does not
   try: both alarm.

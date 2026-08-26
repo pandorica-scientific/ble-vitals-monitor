@@ -30,16 +30,18 @@ offset  value      field
   0     F5         marker (constant)
   1     03         device type: 03 = wristband (base uses 04)
   2     seq        measurement counter, +1 per new reading (~every 20 s)
-  3     state      normally 0x03; the packet that introduces a NEW temperature has bit 0x08 set
-                   (0x0B). Treat 0x08 as a *candidate* "temperature updated" flag (unconfirmed).
+  3     state      bit field. 0x03 = measuring; 0x00 = awake but no valid measurement;
+                   0x80 = idle/charging (no measurement at all); +0x08 = new temperature
+                   committed; +0x04 = new SpO2 committed.                        ★CONFIRMED
   4     0..~77     signal-quality hint
-  5     --         state/session-related
+  5     --         constant 40 while worn, 60 on the charger — candidate battery percent
   6-7   u16 BE     SKIN TEMPERATURE:  skin_C = ((b6<<8)|b7) / 10   (0.1 C resolution)  ★CONFIRMED
   8-9   u16 BE     secondary thermal value (u16 BE / 10); meaning NOT confirmed — do not label
  10     hr         HEART RATE (bpm)                                                    ★CONFIRMED
  11-12  u16 BE     INTER-BEAT INTERVAL in milliseconds (beat_ms)                        ★CONFIRMED
  13     spo2       SpO2 (%)                                                            ★CONFIRMED
- 14-15  16-bit     pulse-derived; meaning NOT confirmed — do not label
+ 14-15  u16 BE     optical return level, NOT a perfusion index — reads higher off fabric
+                   than off a real hand. See below. Do not present it as a vital.
  16-21  MAC        wristband MAC address, little-endian (e.g. 33 05 6C 4E CD F7)
  22     A4         checksum / constant
 ```
@@ -82,6 +84,129 @@ The base's advertisement is a **9-byte identity beacon** only
   against a true 133). It correlates only weakly and with everything at once — signal-quality
   byte +0.49, SpO2 +0.42, heart rate +0.43, bytes 11–12 −0.35 — which is what a perfusion or
   amplitude measure would look like, but that is a guess. Do not label it.
+
+  ### Is it a perfusion index? Tested, and the answer is no — not as it stands
+
+  Worth writing down, because "perfusion index" is the first guess anyone makes about a
+  pulse-derived 16-bit field. Re-analysed over the same 60-minute capture (182 measurements,
+  deduplicated by the byte-2 counter, so each measurement counts once).
+
+  Reading it as **big-endian** is right: `LE` spreads the same data over 1028–65282, `BE` gives a
+  compact 686–1195. The **top nibble of byte 14 is always 0**, so the payload is effectively
+  **12-bit** — the natural width of an optical front end's converter, not of a percentage.
+
+  What points *toward* perfusion:
+  - It drifts rather than jumps. Lag-1 autocorrelation +0.67, lag-5 +0.56; a 7-minute moving
+    average still holds 56% of its variance. Perfusion moves on that timescale.
+  - It rises with the signal-quality byte (+0.49 raw, +0.22 partial, p = 0.003) — a stronger
+    pulse should read as better quality.
+  - With the hour's drift removed from both series, it rises with **skin temperature**
+    (+0.23, p = 0.003). Warmer periphery, more perfusion — the right sign.
+  - It is mostly its own quantity: heart rate, SpO2, beat interval, skin temperature and signal
+    quality together explain only **R² = 0.30** of it.
+
+  What argues *against* it, and is the reason not to label it:
+  - **The dynamic range is far too narrow.** 686–1195 over an hour — a factor of **1.74**.
+    Perfusion index is defined as AC/DC and published ranges span 0.02–20%, three orders of
+    magnitude; even a still subject moves several-fold. This field behaves like something with
+    a floor and a ceiling.
+  - **The distribution is wrong.** Skew −0.27, kurtosis −0.32: symmetric, faintly left-leaning.
+    A perfusion index is strongly right-skewed, near log-normal.
+  - **No scaling makes sense as a percentage.** ÷100 gives 6.9–12.0% (a plausible band, but
+    implausibly stable for a whole hour); ÷10 gives 73–117%, which is not a perfusion index at
+    all. A raw converter number needs no divisor, and that is what 12 bits at a quarter of full
+    scale looks like.
+  - It shows no relationship with beat-to-beat interval scatter (r = −0.05, p = 0.49), which a
+    genuine pulse-amplitude measure would be expected to show.
+
+  **Settled by a controlled run on 2026-08-26** (adult volunteer, 11.5 min, sensor moved through
+  charger -> air -> hand -> air -> hand -> bright laptop screen -> dark room against a mattress).
+  Bytes 14–15 by what was actually under the sensor:
+
+  | under the sensor | n | bytes 14–15 | |
+  |---|---|---|---|
+  | nothing (awake, no contact) | 4 | 391–423 | |
+  | charger, idle beacon | 2 | 439–456 | canned value |
+  | **adult hand, settled** | 2 | **603–653** | a real pulse, hr 68–69 |
+  | **fabric in the dark** | 3 | **712–757** | no pulse at all |
+  | infant wrist, 60 min | 182 | 686–1195 | |
+
+  **A perfusion index cannot read higher against a mattress than against living tissue.** Fabric
+  in the dark (712–757) outscores a settled adult hand with a genuine, internally consistent pulse
+  (603–653). That is fatal to the perfusion reading and it is not a marginal difference.
+
+  What the field actually behaves like is an **optical return level** — how much light comes back
+  to the detector. Pale fabric held close reflects more infrared than skin does, which is exactly
+  the observed ordering; bare air (~400) sits at the bottom, and the infant wrist, strapped tight,
+  at the top. It is also not a free-running light meter: through the 188-second stall while the
+  sensor faced a bright laptop screen the value never updated once, because **the field is only
+  refreshed when the band produces a measurement.**
+
+  Conclusion: it is a signal-strength number attached to each measurement attempt, useful at most
+  as a contact indicator, and it must not be presented as a vital sign. A perfusion index also
+  cannot be *derived* from the broadcast: PI is the ratio of the pulsatile to the steady part of
+  the optical signal, and the advertisement carries neither — no waveform, one scalar per ~20 s.
+
+### The band will invent a heart rate from bedding  ★CONFIRMED — read this one
+
+The most important thing the 2026-08-26 run turned up, and it is not about bytes 14–15.
+
+Left in a dark room facing a mattress, with **no pulse anywhere near it**, the band did not fall
+silent. It produced three fresh measurements, ~20 s apart, reporting **90, 93 and 96 bpm** — values
+a parent would read as a calmly sleeping baby.
+
+They are detectably false, because the band contradicts itself. Byte 10 said 90/93/96 bpm while
+its own beat interval (bytes 11–12) implied 136/149/155 bpm:
+
+| condition | byte 10 | 60000/interval | disagreement |
+|---|---|---|---|
+| adult hand, settled | 68–69 | 71–74 | **−4 bpm** |
+| fabric in the dark | 90–96 | 136–155 | **−54 bpm** |
+
+Against the 60-minute infant capture, where the two decodes agree to a mean of +0.5 bpm with an
+sd of 8.8 (95% of readings inside ±17 bpm), **not one of 182 genuine readings disagreed by more
+than 40 bpm**. Every fabric reading did, by 46–59.
+
+So there is a clean validity test with no false positives in the data available:
+
+> **Reject a reading when `|byte10 − 60000/interval| > 40 bpm`.**
+> Rejects 0 of 182 genuine infant readings; catches all 3 fabric readings.
+> At a 30 bpm threshold it still only rejects 1.1% (2/182) of genuine readings.
+
+This matters more than any labelling question: a band that has come off and is lying in the cot
+reports a plausible, reassuring heart rate rather than an obvious fault. Silence is a visible
+failure; an invented 93 bpm is not.
+
+**Implemented** in `band_protocol.h` as `bandReadingDisagrees()`, and the reading is **not**
+dropped — it is still displayed, logged and fed to the alarm, with **"reading issue"** shown under
+the heart-rate value on the live screen. Hiding a doubtful number would trade one silent failure
+for another; the point is to make the doubt visible to whoever is looking at the screen.
+
+Two smaller edges from the same run:
+
+- **The counter stalls rather than zeroing on contact loss.** Gaps of 79, 131 and 188 s against a
+  20 s median: losing contact shows up as *no new measurement*, while the last frame keeps being
+  rebroadcast. A receiver must treat frame age, not frame content, as the staleness signal.
+- **Off-body skin temperature reads 28.1 °C**, which passes `BAND_SKIN_MIN_C = 28.0` in
+  `band_protocol.h`. An unworn band in a warm room can therefore log a "valid" skin temperature.
+
+### Idle / charging frame  ★CONFIRMED
+
+Off the wrist — on the charger, at least — the wristband still advertises, roughly every 2.1 s
+rather than the ~1.5 s it uses while measuring, and the payload is static:
+
+- `byte[3] == 0x80` (bit 7 set) instead of `0x03`. **Treat bit `0x80` as "not measuring".**
+- `byte[2]` (measurement counter) frozen — it does not advance while idle.
+- Heart rate, SpO2, beat interval, skin temperature and the signal-quality byte are all **0**.
+- `bytes 14–15` hold `0x01B7` (439), see above.
+- `byte[5]` reads **60** here, against a constant **40** across both worn captures. That is the
+  first evidence that byte 5 carries a **battery percentage**, but it is a two-point observation
+  from different days and it did not move over five minutes of charging — a candidate, not a
+  finding. Do not label it yet.
+
+A receiver must therefore not treat a zero heart rate as a reading. `band_protocol.h` decodes
+these frames but leaves the vitals at zero, and both the alert mask and the critical-alarm state
+machine guard on `hr > 0`, so an idle band cannot raise a low-heart-rate alarm.
 - **Skin temperature** = **big-endian `uint16` of bytes 6–7, divided by 10** (°C, 0.1° resolution).
   Verified against the app and independent captures:
   - `01 5D` = 0x015D = 349 → **34.9 °C**  (app shows 35)
@@ -100,10 +225,12 @@ The base's advertisement is a **9-byte identity beacon** only
 ### Temperature update timing
 
 Skin temperature changes only **~every 15 minutes**; the exact same bytes 6–7 repeat across
-all the intervening ~20 s packets. The packet that *introduces* a new temperature had
-**`byte[3] == 0x0B`** (i.e. `0x03 | 0x08`) in every observed case, so `byte[3] & 0x08` is a
-plausible **"new temperature measurement"** flag — treat it as a research candidate, not a
-guarantee. Do **not** create a new temperature datapoint per packet just because a new
+all the intervening ~20 s packets. The packet that *introduces* a new temperature has
+**`byte[3] & 0x08`** set, now checked across all three captures: the flag was set 6 times, the
+temperature changed 6 times, and it **never changed without the flag**. The same test promotes a
+second bit: **`byte[3] & 0x04` marks a new SpO2 commit** — 6 flags, and SpO2 never changed without
+one. (The flag can be set while the committed value repeats the previous one, so treat it as
+"a value was committed", not "the value differs".) Do **not** create a new temperature datapoint per packet just because a new
 advertisement arrived; compare the raw value (and/or watch the flag) instead.
 
 ## Update cadence

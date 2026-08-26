@@ -2,32 +2,56 @@
 
 #include <stdint.h>
 
-// Critical tachycardia alarm. Pure logic: no Arduino, no display, no SD.
+// Critical heart-rate alarm, both directions. Pure logic: no Arduino, no display, no SD.
 //
-// The alarm exists for one situation - a sustained heart rate at or above 200 bpm, which
-// carries a roughly ten-minute window before a hospital visit. Everything here is sized
-// against that number: a one-minute confirmation costs 10% of it, and the alarm latches
-// because an episode that is missed by looking away is an episode that did not exist.
+// The alarm exists for one situation - a sustained heart rate far enough outside the safe band to
+// carry a roughly ten-minute window before a hospital visit. Everything here is sized against
+// that number: a one-minute confirmation costs 10% of it, and the alarm latches because an
+// episode that is missed by looking away is an episode that did not exist.
+//
+// Bradycardia runs the SAME machine with its thresholds read the other way up, set by
+// AlarmConfig::lowSide. Every comparison against a threshold goes through alarmBeyond(), so there
+// is one confirmation window, one latch and one snooze to reason about rather than two copies
+// that can drift apart. Two differences are deliberate, not oversights:
+//
+//   - A zero heart rate is thrown away on the low side before it touches the machine. An idle or
+//     charging band broadcasts hr = 0, and zero is "no reading", not "a very slow heart". On the
+//     high side this never mattered, because zero is nowhere near 200. Here it is everything.
+//   - The implausible-collapse rule stays high-side only. It exists because a fall from a high
+//     rate to a very low one is either the uint8_t wrapping past 255 or a catastrophe, and both
+//     deserve an alarm. The mirror image - a very low rate jumping to a very high one - has no
+//     such reading; against a wristband that manufactures numbers off bedding it is far more
+//     likely to be an artifact, and alarming on it would wake the house for nothing.
 
 enum class AlarmState : uint8_t { IDLE, ARMED, ALARM };
 
+// Appended to, never reordered: an AlarmMachine survives a soft reboot in RTC memory, so the
+// numbering has to stay stable across a firmware update.
 enum class AlarmCause : uint8_t {
   NONE,
   CONFIRMED_HIGH,        // the confirmation window closed with the criteria met
   LOST_WHILE_CRITICAL,   // signal died while armed - silence is not a drop
   IMPLAUSIBLE_COLLAPSE,  // a high rate became a very low one in one step
+  CONFIRMED_LOW,         // the same window, closed on the low side
 };
 
+// "Beyond" a threshold means at or above it on the high side, at or below it on the low side.
+// Every comparison below is written that way round, so the same numbers describe both alarms.
 struct AlarmConfig {
-  int crit = 200;          // arms the window; readings at or above count toward minHigh
-  int sustain = 190;       // the last reading must be at or above this to confirm
-  int cancel = 180;        // a reading below this abandons the window outright
+  int crit = 200;          // arms the window; readings beyond it count toward minCritical
+  int sustain = 190;       // the last reading must be beyond this to confirm
+  int cancel = 180;        // a reading short of this abandons the window outright
   int collapseFrom = 170;  // previous reading at or above this...
   int collapseTo = 60;     // ...and this reading at or below it escalates immediately
-  int minHigh = 2;         // readings at or above crit needed within one window
+  int minCritical = 2;     // readings beyond crit needed within one window
   uint32_t confirmMs = 60'000;
   uint32_t snoozeMs = 600'000;
+  bool lowSide = false;    // read every threshold the other way up
 };
+
+inline bool alarmBeyond(const AlarmConfig& cfg, int hr, int threshold) {
+  return cfg.lowSide ? hr <= threshold : hr >= threshold;
+}
 
 // Plain-old-data so the whole thing can be copied into RTC memory across a soft reboot.
 struct AlarmMachine {
@@ -43,9 +67,9 @@ struct AlarmMachine {
 
   uint32_t windowStartMs = 0;
   int windowReadings = 0;
-  int windowHighCount = 0;
+  int windowCritCount = 0;
   int windowLastHr = 0;
-  bool windowResolving = true;  // strictly decreasing so far
+  bool windowResolving = true;  // moving strictly back toward the safe band so far
 
   uint32_t dismissedMs = 0;
   bool everDismissed = false;
@@ -64,17 +88,19 @@ inline bool alarmSnoozed(const AlarmMachine& m, const AlarmConfig& cfg, uint32_t
 inline void alarmResetWindow(AlarmMachine& m, uint32_t nowMs, int seedHr) {
   m.windowStartMs = nowMs;
   m.windowReadings = 1;
-  m.windowHighCount = 0;
+  m.windowCritCount = 0;
   m.windowLastHr = seedHr;
   m.windowResolving = true;
 }
 
 inline void alarmAccumulate(AlarmMachine& m, const AlarmConfig& cfg, int hr) {
-  // Resolution means strictly decreasing. Holding level breaks it exactly as a rise does:
-  // a rate that has stopped falling has stopped recovering, however it got there.
-  if (m.windowReadings > 0 && hr >= m.windowLastHr) m.windowResolving = false;
+  // Resolution means moving strictly back toward the safe band. Holding level breaks it exactly
+  // as moving the wrong way does: a rate that has stopped recovering has stopped recovering,
+  // however it got there.
+  const bool notRecovering = cfg.lowSide ? hr <= m.windowLastHr : hr >= m.windowLastHr;
+  if (m.windowReadings > 0 && notRecovering) m.windowResolving = false;
   ++m.windowReadings;
-  if (hr >= cfg.crit) ++m.windowHighCount;
+  if (alarmBeyond(cfg, hr, cfg.crit)) ++m.windowCritCount;
   m.windowLastHr = hr;
 }
 
@@ -93,7 +119,7 @@ inline void alarmToIdle(AlarmMachine& m) {
   m.onsetEpoch = 0;
   m.peak = 0;
   m.windowReadings = 0;
-  m.windowHighCount = 0;
+  m.windowCritCount = 0;
   m.windowLastHr = 0;
   m.windowResolving = true;
   m.resolved = false;
@@ -103,14 +129,19 @@ inline void alarmToIdle(AlarmMachine& m) {
 inline AlarmEvent alarmOnReading(AlarmMachine& m, const AlarmConfig& cfg, int hr,
                                  uint32_t nowMs, uint32_t nowEpoch) {
   AlarmEvent event{};
+  // Zero is the absence of a reading. Dropped here, before it can arm anything, seed a window or
+  // pass for a recovery - staleness, not this, is what escalates a band that has gone quiet.
+  if (cfg.lowSide && hr <= 0) return event;
+
   const int previous = m.lastHr;
   const bool hadPrevious = m.haveLast;
   m.lastHr = hr;
   m.haveLast = true;
 
   if (m.state == AlarmState::ALARM) {
-    if (hr > m.peak) m.peak = hr;
-    if (hr > 0 && hr < cfg.crit && !m.resolved) {
+    // "peak" is the most extreme reading of the episode, which on the low side is the lowest.
+    if (cfg.lowSide ? (hr < m.peak) : (hr > m.peak)) m.peak = hr;
+    if (hr > 0 && !alarmBeyond(cfg, hr, cfg.crit) && !m.resolved) {
       m.resolved = true;
       m.resolvedEpoch = nowEpoch;
       event.episodeResolved = true;
@@ -120,7 +151,8 @@ inline AlarmEvent alarmOnReading(AlarmMachine& m, const AlarmConfig& cfg, int hr
 
   // A step from a high rate to a very low one is either the uint8_t wrapping past 255 or a
   // genuine catastrophic event. We cannot tell them apart and do not need to: both alarm.
-  if (hadPrevious && previous >= cfg.collapseFrom && hr > 0 && hr <= cfg.collapseTo) {
+  if (!cfg.lowSide && hadPrevious && previous >= cfg.collapseFrom &&
+      hr > 0 && hr <= cfg.collapseTo) {
     if (!alarmSnoozed(m, cfg, nowMs)) {
       m.peak = previous > hr ? previous : hr;
       alarmEnter(m, AlarmCause::IMPLAUSIBLE_COLLAPSE, nowEpoch, event);
@@ -129,22 +161,22 @@ inline AlarmEvent alarmOnReading(AlarmMachine& m, const AlarmConfig& cfg, int hr
   }
 
   if (m.state == AlarmState::IDLE) {
-    if (hr >= cfg.crit) {
+    if (alarmBeyond(cfg, hr, cfg.crit)) {
       m.state = AlarmState::ARMED;
       m.onsetEpoch = nowEpoch;
       m.peak = hr;
       alarmResetWindow(m, nowMs, hr);
-      m.windowHighCount = 1;
+      m.windowCritCount = 1;
     }
     return event;
   }
 
   // ARMED
-  if (hr > 0 && hr < cfg.cancel) {
+  if (hr > 0 && !alarmBeyond(cfg, hr, cfg.cancel)) {
     alarmToIdle(m);
     return event;
   }
-  if (hr > m.peak) m.peak = hr;
+  if (cfg.lowSide ? (hr < m.peak) : (hr > m.peak)) m.peak = hr;
   alarmAccumulate(m, cfg, hr);
   return event;
 }
@@ -169,11 +201,12 @@ inline AlarmEvent alarmTick(AlarmMachine& m, const AlarmConfig& cfg, uint32_t no
   // A trend cannot be established from one point, and that point was at or above crit,
   // so the unreachable single-reading case fails toward alarming.
   const bool notResolving = m.windowReadings < 2 || !m.windowResolving;
-  const bool confirmed = m.windowLastHr >= cfg.sustain &&
-                         (m.windowHighCount >= cfg.minHigh || notResolving);
+  const bool confirmed = alarmBeyond(cfg, m.windowLastHr, cfg.sustain) &&
+                         (m.windowCritCount >= cfg.minCritical || notResolving);
 
   if (confirmed && !alarmSnoozed(m, cfg, nowMs)) {
-    alarmEnter(m, AlarmCause::CONFIRMED_HIGH, m.onsetEpoch, event);
+    alarmEnter(m, cfg.lowSide ? AlarmCause::CONFIRMED_LOW : AlarmCause::CONFIRMED_HIGH,
+               m.onsetEpoch, event);
     return event;
   }
 
@@ -182,7 +215,7 @@ inline AlarmEvent alarmTick(AlarmMachine& m, const AlarmConfig& cfg, uint32_t no
   // because every window would expire just short and start again from nothing.
   const int carried = m.windowLastHr;
   alarmResetWindow(m, nowMs, carried);
-  if (carried >= cfg.crit) m.windowHighCount = 1;
+  if (alarmBeyond(cfg, carried, cfg.crit)) m.windowCritCount = 1;
   return event;
 }
 

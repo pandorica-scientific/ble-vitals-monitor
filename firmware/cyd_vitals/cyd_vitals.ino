@@ -57,6 +57,13 @@
 #define HR_COLLAPSE_FROM    170   // previous reading at or above this...
 #define HR_COLLAPSE_TO       60   // ...and this one at or below it escalates at once
 #define HR_RAIL             255   // the uint8_t ceiling; shown as ">=255"
+// ---- critical bradycardia alarm ----
+// The same machine and the same window, thresholds read the other way up. The scale mirrors the
+// tachycardia one - 10 bpm of slack to confirm, 20 to abandon - and HR_SUSTAIN_LOW deliberately
+// equals HR_LOW, exactly as HR_CANCEL equals HR_HIGH, so all six numbers read as one design.
+#define HR_CRIT_LOW          80   // bpm at or below which the alarm arms
+#define HR_SUSTAIN_LOW       90   // the last reading of the window must be at or below this
+#define HR_CANCEL_LOW       100   // a reading above this abandons the window
 #define CRIT_MIN_HIGH         2   // readings at or above HR_CRIT needed in one window
 #define CRIT_CONFIRM_MS   60000   // confirmation window length
 #define ALARM_SNOOZE_MS  600000   // suppression after a dismissal, so the board can be carried
@@ -286,8 +293,22 @@ RTC_DATA_ATTR esp_reset_reason_t g_origReason=ESP_RST_UNKNOWN;
 // RTC memory alongside g_origReason. RTC memory does NOT survive a power cut, which is why the
 // onset is also written to /alerts.csv the moment it happens and reconciled at boot.
 RTC_DATA_ATTR AlarmMachine g_alarm;
+RTC_DATA_ATTR AlarmMachine g_alarmLow;
 const AlarmConfig ALARM_CFG{HR_CRIT,HR_SUSTAIN,HR_CANCEL,HR_COLLAPSE_FROM,HR_COLLAPSE_TO,
                             CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS};
+// Collapse thresholds are carried but unused: the collapse rule is high-side only, see
+// critical_alarm.h. The trailing true is what makes every comparison read the other way up.
+const AlarmConfig ALARM_LOW_CFG{HR_CRIT_LOW,HR_SUSTAIN_LOW,HR_CANCEL_LOW,
+                                HR_COLLAPSE_FROM,HR_COLLAPSE_TO,
+                                CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS,true};
+
+// Two machines, one screen. Whichever is latched owns the display; if somehow both are, the fast
+// one wins, because a rate above 200 needs a hospital sooner than one below 80.
+inline AlarmMachine* firingAlarm(){
+  if(g_alarm.state==AlarmState::ALARM) return &g_alarm;
+  if(g_alarmLow.state==AlarmState::ALARM) return &g_alarmLow;
+  return nullptr;
+}
 Contacts g_contacts;
 HoldState g_hold;
 int g_alarmKey=0; bool g_alarmKeyValid=false;
@@ -484,9 +505,11 @@ void reconcileOpenEpisode(){
     reconcileAlertLine(ln.c_str(),(uint32_t)mktime(&tm),open);
   }
   f.close();
-  if(open.open && g_alarm.state!=AlarmState::ALARM){
-    g_alarm.state=AlarmState::ALARM; g_alarm.cause=AlarmCause::CONFIRMED_HIGH;
-    g_alarm.onsetEpoch=open.onsetEpoch; g_alarm.resolved=false;
+  if(open.open && firingAlarm()==nullptr){
+    AlarmMachine& m = open.low ? g_alarmLow : g_alarm;
+    m.state=AlarmState::ALARM;
+    m.cause = open.low ? AlarmCause::CONFIRMED_LOW : AlarmCause::CONFIRMED_HIGH;
+    m.onsetEpoch=open.onsetEpoch; m.resolved=false;
     logAlert("BOOT_RESUME",0,0,"recovered from card");
   }
 }
@@ -691,8 +714,20 @@ void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,ui
   if(stale || reading.oxygenSaturation == 0) strlcpy(oxygenText,"--",sizeof(oxygenText));
   else snprintf(oxygenText,sizeof(oxygenText),"%d",reading.oxygenSaturation);
   // top row: big current values
-  if(full || key.heartRate!=prev.heartRate || key.stale!=prev.stale)
-    cell(0,0,"HEART",heartText,"bpm",d?DIM:((reading.heartRate<HR_LOW||reading.heartRate>HR_HIGH)?TFT_RED:0x6E6C));
+  if(full || key.heartRate!=prev.heartRate || key.stale!=prev.stale ||
+     key.readingIssue!=prev.readingIssue){
+    cell(0,0,"HEART",heartText,"bpm",
+         d?DIM:((reading.heartRate&&(reading.heartRate<HR_LOW||reading.heartRate>HR_HIGH))?TFT_RED:0x6E6C));
+    // The band contradicting itself - byte 10 against its own beat interval - means the number
+    // above is doubtful, most likely read off bedding rather than a wrist. Say so under the
+    // value rather than hiding the reading: a blank is a visible fault, a wrong number is not.
+    if(key.readingIssue){
+      tft.setFont(&fonts::FreeSans9pt7b); tft.setTextSize(1);
+      tft.setTextColor(d?DIM:TFT_ORANGE);
+      tft.setTextDatum(textdatum_t::bottom_left);
+      tft.drawString("reading issue",8,HDR+RH-4);
+    }
+  }
   if(full || key.oxygenSaturation!=prev.oxygenSaturation || key.stale!=prev.stale)
     cell(1,0,"OXYGEN",oxygenText,"%",d?DIM:((reading.oxygenSaturation&&reading.oxygenSaturation<SPO2_LOW)?TFT_RED:0x74FF));
   // bottom row: 1-hour sparklines. Redrawn when the alert bar appears or clears too, because the
@@ -947,7 +982,7 @@ void setup(){
   applyBrightness(); applyTheme();
   bootMsg("Loading history..."); loadCsvToday();
   loadContacts(); reconcileOpenEpisode();
-  if(g_alarm.state==AlarmState::ALARM){ view=ALARM; setBacklight(255); }
+  if(firingAlarm()!=nullptr){ view=ALARM; setBacklight(255); }
   bootMsg("Bluetooth...");
   BLEDevice::init(""); g_bleScanner=BLEDevice::getScan();
   g_bleScanner->setAdvertisedDeviceCallbacks(new CB(),true);
@@ -963,8 +998,10 @@ void setup(){
 void onAlarmStarted(const ReadingSnapshot& r){
   g_selfTest=false;                 // a real alarm during a self-test must not be labelled TEST
   view=ALARM; setBacklight(255); g_renderKeyValid=false; g_alarmKeyValid=false;
-  logAlert("ONSET",r.heartRate,r.oxygenSaturation,alarmCauseName(g_alarm.cause));
-  Serial.printf("[alarm] %s hr=%d\n",alarmCauseName(g_alarm.cause),r.heartRate);
+  const AlarmMachine* m=firingAlarm();
+  const AlarmCause cause = m ? m->cause : AlarmCause::NONE;
+  logAlert("ONSET",r.heartRate,r.oxygenSaturation,alarmCauseName(cause));
+  Serial.printf("[alarm] %s hr=%d\n",alarmCauseName(cause),r.heartRate);
 }
 
 void leaveAlarmView(){
@@ -981,7 +1018,11 @@ void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool 
   if(hold.completed){
     if(!g_selfTest){
       logAlert("DISMISS",reading.heartRate,reading.oxygenSaturation,"dismissed");
+      // Both, always. One hold silences the screen, so it has to silence what put it there and
+      // snooze the other side too - otherwise dismissing a low alarm can be followed a second
+      // later by a high one from the same run of doubtful readings.
       alarmDismiss(g_alarm,millis());
+      alarmDismiss(g_alarmLow,millis());
     }
     leaveAlarmView(); return;
   }
@@ -991,11 +1032,13 @@ void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool 
 
   const uint32_t nowE=nowEpochOrZero();
   AlarmAppearance a;
-  a.machine=&g_alarm; a.contacts=&g_contacts;
+  AlarmMachine* firing=firingAlarm();
+  a.machine = firing ? firing : &g_alarm;    // self-test borrows the high machine's empty state
+  a.contacts=&g_contacts;
   a.heartRate=reading.heartRate; a.oxygen=reading.oxygenSaturation;
   a.oxygenAgeMin = (g_spo2StampEpoch && nowE>=g_spo2StampEpoch)
                      ? static_cast<int>((nowE-g_spo2StampEpoch)/60) : -1;
-  a.elapsedS = g_selfTest ? 0 : alarmElapsedS(g_alarm,nowE);
+  a.elapsedS = g_selfTest ? 0 : alarmElapsedS(*a.machine,nowE);
   a.selfTest=g_selfTest;
   a.selfTestLeftS=static_cast<int>(SELFTEST_DURATION_S-(millis()-g_selfTestStart)/1000);
   a.stale=stale; a.radioState=radioState;
@@ -1047,7 +1090,7 @@ void loop(){
   }
   // Swipe up -> share the logged data, but never during an alarm: enterExport() deinitialises
   // Bluetooth and replaces the screen, which would hide the alarm and stop the readings feeding it.
-  if(g==2 && view==LIVE && g_alarm.state!=AlarmState::ALARM){ enterExport(); return; }
+  if(g==2 && view==LIVE && firingAlarm()==nullptr){ enterExport(); return; }
 
   // Hold the HEART cell to run the alarm self-check. This resolves while still touching, unlike
   // readGesture()'s tap, because the countdown has to be drawn during the hold; holdConsumedTap
@@ -1107,11 +1150,14 @@ void loop(){
       const uint32_t nowE=nowEpochOrZero();      // one clock read per reading, not three
       if(reading.oxygenSaturation>0) g_spo2StampEpoch=nowE;
       AlarmEvent ev=alarmOnReading(g_alarm,ALARM_CFG,reading.heartRate,millis(),nowE);
-      if(ev.alarmStarted) onAlarmStarted(reading);
-      if(ev.episodeResolved) logAlert("RESOLVED",reading.heartRate,reading.oxygenSaturation,"");
+      AlarmEvent evLow=alarmOnReading(g_alarmLow,ALARM_LOW_CFG,reading.heartRate,millis(),nowE);
+      if(ev.alarmStarted||evLow.alarmStarted) onAlarmStarted(reading);
+      if(ev.episodeResolved||evLow.episodeResolved)
+        logAlert("RESOLVED",reading.heartRate,reading.oxygenSaturation,"");
     }
     AlarmEvent tick=alarmTick(g_alarm,ALARM_CFG,millis(),stale);
-    if(tick.alarmStarted) onAlarmStarted(reading);
+    AlarmEvent tickLow=alarmTick(g_alarmLow,ALARM_LOW_CFG,millis(),stale);
+    if(tick.alarmStarted||tickLow.alarmStarted) onAlarmStarted(reading);
   }
 
   if(view==ALARM || g_selfTest){

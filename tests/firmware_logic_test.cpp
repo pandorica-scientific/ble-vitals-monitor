@@ -56,6 +56,34 @@ static void testBandDecoder() {
   expect(!reading.skinValid, "10.0 C skin is marked invalid");
 }
 
+// The band reports a heart rate off bedding: 90/93/96 bpm against a mattress while its own beat
+// interval implied 136/149/155. Worn, the two decodes agree. See docs/PROTOCOL.md.
+static void testReadingDisagreement() {
+  const uint8_t frame[23] = {
+      0xF5, 0x03, 0x2D, 0x03, 0x04, 0x28, 0x01, 0x70,
+      0x01, 0x70, 0x6C, 0x02, 0x30, 0x62, 0x03, 0x36,
+      0x33, 0x05, 0x6C, 0x4E, 0xCD, 0xF7, 0xA4};
+  BandReading reading{};
+  expect(decodeBandFrame(frame, sizeof(frame), reading), "frame decodes");
+  expect(reading.beatMs == 560, "beat interval is big-endian bytes 11-12");
+  expect(!bandReadingDisagrees(reading.heartRate, reading.beatMs),
+         "108 bpm against a 560 ms interval (107 bpm) agrees");
+
+  // The three fabric measurements captured on 2026-08-26.
+  expect(bandReadingDisagrees(90, 440), "90 bpm against 136 bpm implied is flagged");
+  expect(bandReadingDisagrees(93, 404), "93 bpm against 149 bpm implied is flagged");
+  expect(bandReadingDisagrees(96, 387), "96 bpm against 155 bpm implied is flagged");
+
+  // Settled on an adult hand the same day, and the worst genuine infant disagreement seen.
+  expect(!bandReadingDisagrees(69, 840), "69 bpm against 71 bpm implied is accepted");
+  expect(!bandReadingDisagrees(68, 815), "68 bpm against 74 bpm implied is accepted");
+  expect(!bandReadingDisagrees(120, 462), "a 10 bpm spread stays inside the band");
+
+  expect(!bandReadingDisagrees(0, 440), "an idle band with no heart rate is not an issue");
+  expect(!bandReadingDisagrees(96, 0), "a missing interval cannot contradict anything");
+  expect(!bandReadingDisagrees(0, 0), "the charging beacon is not an issue");
+}
+
 static void testReadingMerge() {
   ReadingSnapshot previous{};
   previous.sequence = 44;
@@ -222,6 +250,9 @@ static void testLiveRenderKey() {
   second.signal++;
   expect(first != second, "signal change redraws header");
   second = first;
+  second.readingIssue = !second.readingIssue;
+  expect(first != second, "a doubtful reading redraws the heart cell");
+  second = first;
   second.minuteKey++;
   expect(first != second, "new minute redraws clock");
 }
@@ -242,6 +273,130 @@ static AlarmMachine runWindow(const AlarmConfig& cfg, const std::vector<int>& re
     alarmTick(m, cfg, t, false);
   }
   return m;
+}
+
+// The same machine with its thresholds read the other way up: arms at or below 80, confirms at
+// or below 90, abandons above 100. Mirrors testCriticalAlarm() case for case.
+static AlarmConfig lowConfig() {
+  AlarmConfig cfg{};
+  cfg.crit = 80;
+  cfg.sustain = 90;
+  cfg.cancel = 100;
+  cfg.lowSide = true;
+  return cfg;
+}
+
+static void testLowAlarm() {
+  const AlarmConfig cfg = lowConfig();
+
+  // A zero heart rate is not a slow one. An idle or charging band broadcasts it every ~2 s, and
+  // it must never arm, seed a window, or count as a recovery.
+  {
+    AlarmMachine m{};
+    for (int i = 0; i < 20; ++i) alarmOnReading(m, cfg, 0, i * 20'000u, 1'000'000 + i * 20);
+    expect(m.state == AlarmState::IDLE, "a charging band never arms the low alarm");
+    expect(!m.haveLast, "a zero reading is not remembered as a reading");
+    AlarmMachine idle = runWindow(cfg, {0, 0, 0, 0});
+    expect(idle.state == AlarmState::IDLE, "a window of zeros does not alarm");
+  }
+
+  // 1: one qualifying reading arms but does not alarm
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 75, 0, 1'000'000);
+    expect(m.state == AlarmState::ARMED, "one reading at 75 arms");
+    alarmTick(m, cfg, 5'000, false);
+    expect(m.state == AlarmState::ARMED, "still armed before the window closes");
+    expect(m.peak == 75, "the episode extreme starts at the arming reading");
+  }
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 80, 0, 1'000'000);
+    expect(m.state == AlarmState::ARMED, "the threshold itself is inclusive");
+    AlarmMachine n{};
+    alarmOnReading(n, cfg, 81, 0, 1'000'000);
+    expect(n.state == AlarmState::IDLE, "81 is inside the safe band");
+  }
+
+  // 2: sustained readings alarm, onset is the FIRST reading
+  {
+    AlarmMachine m = runWindow(cfg, {75, 74, 73, 72});
+    expect(m.state == AlarmState::ALARM, "a sustained slow rate alarms");
+    expect(m.cause == AlarmCause::CONFIRMED_LOW, "cause is CONFIRMED_LOW");
+    expect(m.onsetEpoch == 1'000'000, "onset is the first qualifying reading");
+    expect(m.peak == 72, "the extreme of a low episode is its slowest reading");
+  }
+
+  // 3: a reading past cancel returns to IDLE
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 75, 0, 1'000'000);
+    alarmOnReading(m, cfg, 101, 20'000, 1'000'020);
+    expect(m.state == AlarmState::IDLE, "101 cancels the window");
+  }
+
+  // 4: staleness while armed escalates - silence over a slow heart is not a recovery
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 75, 0, 1'000'000);
+    AlarmEvent e = alarmTick(m, cfg, 30'000, true);
+    expect(m.state == AlarmState::ALARM, "stale while armed alarms");
+    expect(m.cause == AlarmCause::LOST_WHILE_CRITICAL, "cause is LOST_WHILE_CRITICAL");
+    expect(e.alarmStarted, "the transition is reported once");
+    expect(!alarmTick(m, cfg, 31'000, true).alarmStarted, "repeated stale ticks do not re-fire");
+  }
+
+  // 5: recovery resolves the latched episode but does not clear it
+  {
+    AlarmMachine m = runWindow(cfg, {75, 74, 73, 72});
+    AlarmEvent e = alarmOnReading(m, cfg, 120, 200'000, 1'000'200);
+    expect(e.episodeResolved, "climbing back above the threshold resolves the episode");
+    expect(m.state == AlarmState::ALARM, "the alarm still latches until it is dismissed");
+    expect(!alarmOnReading(m, cfg, 125, 220'000, 1'000'220).episodeResolved,
+           "resolution is reported once");
+  }
+
+  // 6: the collapse rule stays high-side only
+  {
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 55, 0, 1'000'000);
+    alarmOnReading(m, cfg, 175, 20'000, 1'000'020);
+    expect(m.cause != AlarmCause::IMPLAUSIBLE_COLLAPSE,
+           "a jump from slow to fast is an artifact, not a collapse");
+  }
+
+  // 7: the window table, mirrored. Recovery means climbing.
+  struct LowCase { std::vector<int> readings; bool alarms; const char* why; };
+  const std::vector<LowCase> cases = {
+    {{75, 85, 95},  false, "climbing and ends above sustain"},
+    {{75, 95, 85},  true,  "fell again, ends below sustain"},
+    {{75, 85, 85},  true,  "flat is not recovering"},
+    {{75, 85, 84},  true,  "a one-beat fall is still not recovering"},
+    {{75, 82, 87},  false, "strictly climbing with one critical reading"},
+    {{75, 80, 85},  true,  "count path fires despite climbing"},
+    {{75, 95, 92},  false, "climbed but ends above sustain"},
+    {{75, 79, 75},  true,  "two critical readings, ends low"},
+    {{75, 75},      true,  "count is absolute, not a fraction"},
+    {{75, 80, 90},  true,  "sustain boundary is inclusive"},
+  };
+  for (const LowCase& c : cases) {
+    AlarmMachine m = runWindow(cfg, c.readings);
+    const bool alarmed = m.state == AlarmState::ALARM;
+    expect(alarmed == c.alarms, c.why);
+  }
+
+  // 8: a dismissal snoozes the low alarm exactly as it does the high one
+  {
+    AlarmMachine m = runWindow(cfg, {75, 74, 73, 72});
+    alarmDismiss(m, 200'000);
+    expect(m.state == AlarmState::IDLE, "dismissal clears the latch");
+    AlarmMachine again = m;
+    for (uint32_t t = 200'000; t <= 340'000; t += 1'000) {
+      if (t % 20'000 == 0) alarmOnReading(again, cfg, 70, t, 1'000'000 + t / 1000);
+      alarmTick(again, cfg, t, false);
+    }
+    expect(again.state != AlarmState::ALARM, "a fresh episode inside the snooze stays silent");
+  }
 }
 
 static void testCriticalAlarm() {
@@ -506,6 +661,11 @@ static void testAlertLog() {
   {
     OpenEpisode s{};
     reconcileAlertLine("2026-08-10 03:14:22,ONSET,214,94,CONFIRMED_HIGH", 1'000'000, s);
+    expect(!s.low, "a high onset is not marked low");
+    OpenEpisode slow{};
+    // Resumed after a power cut, the screen has to say which way the heart rate went.
+    reconcileAlertLine("2026-08-10 03:14:22,ONSET,68,94,CONFIRMED_LOW", 1'000'000, slow);
+    expect(slow.open && slow.low, "a low onset is remembered as low");
     expect(s.open && s.onsetEpoch == 1'000'000, "an unmatched onset is open");
   }
   // a DISMISS closes it
@@ -513,6 +673,7 @@ static void testAlertLog() {
     OpenEpisode s{};
     reconcileAlertLine("2026-08-10 03:14:22,ONSET,214,94,CONFIRMED_HIGH", 1'000'000, s);
     reconcileAlertLine("2026-08-10 03:20:58,DISMISS,171,93,peak=221", 1'000'396, s);
+    expect(!s.low, "a dismissed episode carries no side");
     expect(!s.open, "a dismiss closes the episode");
   }
   // two closed episodes then an open third
@@ -748,6 +909,8 @@ int main() {
   testNightWindowWrapsMidnight();
   testBrightnessRamp();
   testBandDecoder();
+  testReadingDisagreement();
+  testLowAlarm();
   testReadingMerge();
   testRadioHealth();
   testWifiFailover();
