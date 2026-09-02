@@ -38,9 +38,8 @@ inline bool decodeBandFrame(const uint8_t* bytes, size_t length, BandReading& ou
 // disagreed by more than 40. Every fabric reading disagreed by 46-59. So 40 bpm separates them
 // with no false positives in the data we have.
 //
-// This only marks the reading. It is still displayed, still logged, still fed to the alarm: a
-// receiver that silently drops readings is worse than one that shows a doubtful number and says
-// so. See docs/PROTOCOL.md.
+// When they disagree the beat interval is the one to trust, and the reading is corrected rather
+// than merely marked. See effectiveHeartRate() below. See docs/PROTOCOL.md.
 constexpr int BAND_HR_DISAGREE_BPM = 40;
 
 inline bool bandReadingDisagrees(int heartRate, int beatMs) {
@@ -51,10 +50,47 @@ inline bool bandReadingDisagrees(int heartRate, int beatMs) {
   return diff > static_cast<float>(BAND_HR_DISAGREE_BPM);
 }
 
+// Byte 10 does not only invent a rate off bedding - worn, it also locks onto every second beat and
+// reports half the truth. Across 33 days of logs (~115,000 readings) the rate fell to almost
+// exactly half of the preceding two minutes 70 times, typically ~160 -> ~80 for 40 s to 5 minutes,
+// and it never once read above 191. A band that cannot say 200 cannot raise a tachycardia alarm,
+// and a halved 160 arrives as an 80 that trips the bradycardia alarm instead. Both failures are
+// the same bug, and both are corrected by the same field.
+//
+// So when the two decodes disagree, the beat interval wins: it is a measured interval rather than
+// a tracker's average, and it is what caught the bedding readings too. The interval is only
+// trusted inside a range no human heart leaves. 150 ms is 400 bpm - infant SVT reaches 250-300,
+// so the ceiling has to sit well above it - and 2000 ms is 30 bpm. Outside that the field is
+// garbage and the raw byte is kept, doubtful but at least measured.
+constexpr int BAND_BEAT_MS_MIN = 150;   // 400 bpm
+constexpr int BAND_BEAT_MS_MAX = 2000;  // 30 bpm
+
+inline bool bandBeatPlausible(int beatMs) {
+  return beatMs >= BAND_BEAT_MS_MIN && beatMs <= BAND_BEAT_MS_MAX;
+}
+
+// The rate to display, plot, log and alarm on. Equal to the raw byte unless the band contradicts
+// itself with a usable interval. A zero heart rate stays zero: an idle or charging band must never
+// be handed a manufactured rate.
+inline int effectiveHeartRate(int heartRate, int beatMs) {
+  if (heartRate <= 0) return heartRate;
+  if (!bandBeatPlausible(beatMs)) return heartRate;
+  if (!bandReadingDisagrees(heartRate, beatMs)) return heartRate;
+  return (60000 + beatMs / 2) / beatMs;
+}
+
+inline bool readingCorrected(int heartRate, int beatMs) {
+  return effectiveHeartRate(heartRate, beatMs) != heartRate;
+}
+
 struct ReadingSnapshot {
   int sequence = -1;
-  int heartRate = 0;
+  int heartRate = 0;            // byte 10, exactly as broadcast - the raw column in the CSV
   int beatMs = 0;
+  // Derived once here so the display, the plots, both alarms and the log cannot disagree about
+  // what the rate was. Everything downstream reads these two rather than recomputing.
+  int effectiveHeartRate = 0;
+  bool heartRateCorrected = false;
   int oxygenSaturation = 0;
   int signal = 0;
   int rssi = 0;
@@ -69,6 +105,8 @@ inline ReadingSnapshot mergeBandReading(const ReadingSnapshot& previous, const B
   next.sequence = frame.sequence;
   next.heartRate = frame.heartRate;
   next.beatMs = frame.beatMs;
+  next.effectiveHeartRate = effectiveHeartRate(frame.heartRate, frame.beatMs);
+  next.heartRateCorrected = next.effectiveHeartRate != frame.heartRate;
   next.oxygenSaturation = frame.oxygenSaturation;
   next.signal = frame.signal;
   next.rssi = rssi;

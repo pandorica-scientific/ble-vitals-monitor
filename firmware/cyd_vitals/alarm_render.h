@@ -34,7 +34,9 @@
 struct AlarmAppearance {
   const AlarmMachine* machine = nullptr;
   const Contacts* contacts = nullptr;
-  int heartRate = 0;
+  int heartRate = 0;         // the rate on screen: corrected where the band needed correcting
+  int rawHeartRate = 0;      // the band's own byte, shown small when the two differ
+  bool corrected = false;
   int oxygen = 0;
   int oxygenAgeMin = -1;    // -1 when unknown
   uint32_t elapsedS = 0;
@@ -113,16 +115,22 @@ inline void drawAlarmStatic(const AlarmAppearance& a){
   tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(ALARM_TEXT);
   tft.setTextDatum(textdatum_t::top_left);
   const bool low = a.machine && a.machine->cause == AlarmCause::CONFIRMED_LOW;
-  tft.drawString(a.selfTest ? "TEST - SELF-CHECK" : (low ? "LOW HEART RATE" : "HIGH HEART RATE"),
-                 10, 10);
+  // The beat-interval title is not decoration: it tells whoever is reading the screen at 3 a.m.
+  // that the number came from the band's beat timing rather than its heart-rate byte, which is
+  // the first thing a clinician will ask about a rate this receiver was not supposed to see.
+  const bool beat = a.machine && a.machine->cause == AlarmCause::CONFIRMED_HIGH_BEAT;
+  const char* title = low ? "LOW HEART RATE" : (beat ? "HIGH RATE (beat)" : "HIGH HEART RATE");
+  tft.drawString(a.selfTest ? "TEST - SELF-CHECK" : title, 10, 10);
 
   char hr[12];
   // The byte cannot express more than 255, so at the rail the true rate is unknown and at least
   // this high. Saying ">=255" is honest; printing 255 is not. A stale reading is shown as "--"
   // for the same reason: a number frozen ten minutes ago is not a measurement, and on this screen
   // above all it must not look like one.
+  // The rail belongs to the byte. A corrected rate is computed from an interval and can state a
+  // number above 255 exactly, so ">=255" there would hide the very reading worth reading.
   if(a.stale)              snprintf(hr,sizeof(hr),"--");
-  else if(a.heartRate>=HR_RAIL) snprintf(hr,sizeof(hr),">=255");
+  else if(!a.corrected && a.heartRate>=HR_RAIL) snprintf(hr,sizeof(hr),">=255");
   else if(a.heartRate<=0)  snprintf(hr,sizeof(hr),"--");
   else snprintf(hr,sizeof(hr),"%d",a.heartRate);
   tft.setFont(&fonts::FreeSansBold12pt7b); tft.setTextColor(ALARM_RED);
@@ -144,7 +152,12 @@ inline void drawAlarmStatic(const AlarmAppearance& a){
   if(!warn){
     // On the low side the extreme of the episode is its slowest reading, so calling it a peak
     // would read as the opposite of what happened.
-    char pk[20]; snprintf(pk,sizeof(pk),"%s %d",low?"low":"peak",a.machine?a.machine->peak:0);
+    char pk[36];
+    if(a.corrected)
+      snprintf(pk,sizeof(pk),"%s %d - band %d",low?"low":"peak",
+               a.machine?a.machine->peak:0,a.rawHeartRate);
+    else
+      snprintf(pk,sizeof(pk),"%s %d",low?"low":"peak",a.machine?a.machine->peak:0);
     tft.setTextColor(DIM); tft.drawString(pk,46,62);
   }
 

@@ -20,7 +20,8 @@ inline uint8_t makeAlertMask(int heartRate, int oxygen, bool stale,
 struct LiveRenderKey {
   bool stale = true;
   int sequence = -1;
-  int heartRate = 0;
+  int heartRate = 0;              // raw byte - still shown, in small type, when corrected
+  int effectiveHeartRate = 0;     // what the big number reads
   int oxygenSaturation = 0;
   int signal = 0;
   int skinTenths = 0;
@@ -28,23 +29,31 @@ struct LiveRenderKey {
   RadioState radioState = RadioState::STARTING;
   uint8_t alertMask = ALERT_NONE;
   int minuteKey = -1;
-  bool readingIssue = false;
+  bool corrected = false;         // the rate came from the beat interval
+  bool readingIssue = false;      // the two decodes disagree but the interval is unusable
 };
 
 inline LiveRenderKey makeLiveRenderKey(const ReadingSnapshot& reading, RadioState radioState,
                                        bool stale, uint8_t alertMask, int minuteKey) {
-  return {stale, reading.sequence, reading.heartRate, reading.oxygenSaturation,
+  const bool corrected = !stale && reading.heartRateCorrected;
+  // A disagreement the interval cannot resolve is still worth saying out loud; it is the bedding
+  // case with a garbage interval, and the number on screen is the doubtful raw byte.
+  const bool issue = !stale && !corrected &&
+                     bandReadingDisagrees(reading.heartRate, reading.beatMs);
+  return {stale, reading.sequence, reading.heartRate, reading.effectiveHeartRate,
+          reading.oxygenSaturation,
           reading.signal, static_cast<int>(reading.skinC * 10.0f + 0.5f),
-          reading.skinValid, radioState, alertMask, minuteKey,
-          !stale && bandReadingDisagrees(reading.heartRate, reading.beatMs)};
+          reading.skinValid, radioState, alertMask, minuteKey, corrected, issue};
 }
 
 inline bool operator==(const LiveRenderKey& a, const LiveRenderKey& b) {
   return a.stale == b.stale && a.sequence == b.sequence && a.heartRate == b.heartRate &&
+         a.effectiveHeartRate == b.effectiveHeartRate &&
          a.oxygenSaturation == b.oxygenSaturation && a.signal == b.signal &&
          a.skinTenths == b.skinTenths && a.skinValid == b.skinValid &&
          a.radioState == b.radioState && a.alertMask == b.alertMask &&
-         a.minuteKey == b.minuteKey && a.readingIssue == b.readingIssue;
+         a.minuteKey == b.minuteKey && a.corrected == b.corrected &&
+         a.readingIssue == b.readingIssue;
 }
 
 inline bool operator!=(const LiveRenderKey& a, const LiveRenderKey& b) { return !(a == b); }

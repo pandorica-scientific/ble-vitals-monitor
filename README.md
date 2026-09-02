@@ -233,6 +233,16 @@ single snooze to reason about rather than two that can drift apart. Two differen
   rate jumping to a very fast one — has no such justification, and against a wristband that will
   manufacture numbers off bedding it would wake the house for an artifact.
 
+- **A rate corrected from the beat interval is held to a higher bar.** The wristband's heart-rate
+  byte intermittently locks onto every second beat and reports half the truth — 70 times in 33
+  days of logs, and it has never once read above 191. The band also broadcasts the interval between
+  beats, so when the two contradict each other the interval wins and the corrected rate is what the
+  screen, the plots and both alarms use. Because that number is one step further from the sensor,
+  a window containing any corrected reading needs **three readings across two minutes** rather than
+  two across one, and a corrected reading can never trigger the collapse rule above. An episode
+  confirmed this way is titled **HIGH RATE (beat)** and logged as `CONFIRMED_HIGH_BEAT`, so it is
+  always clear which decode raised it. See `docs/PROTOCOL.md`.
+
 Dismissing silences both sides at once: one hold, one snooze.
 
 Because the minute is counted rather than thrown away, the timer already reads `01:00` when the
@@ -259,7 +269,7 @@ until you do — no reading clears it, no dropout clears it, and it survives a r
 and `/alerts.csv`. After a dismissal it stays quiet for ten minutes, then returns if the rate is
 still high, so it cannot be silenced and forgotten. Swiping up to export is refused while it is up.
 
-**Test it.** Hold the **HEART** cell for three seconds to run a ten-second `TEST` alarm — real
+**Test it.** Hold the **HEART** cell for three seconds to run a one-minute `TEST` alarm — real
 brightness, real flashing, no log entry. **Run it from where you actually sleep, with the lights as
 they normally are.** It is the only way to find out whether the alarm reaches you.
 
@@ -282,7 +292,13 @@ timestamp,event,hr_bpm,spo2_pct,detail
 2026-08-10 03:14:22,ONSET,214,94,CONFIRMED_HIGH
 2026-08-10 03:19:41,RESOLVED,176,93,
 2026-08-10 03:20:58,DISMISS,171,93,dismissed
+2026-09-02 15:47:10,ONSET,221,96,CONFIRMED_HIGH_BEAT band=110 beat=271ms
 ```
+
+`hr_bpm` here is the rate the alarm acted on. When that rate came from the beat interval the detail
+column keeps the band's own number and the interval behind it, so the episode can be checked later
+against the daily log.
+
 
 A six-minute episode that resolves on its own at three in the morning leaves a record worth showing
 a clinician. Neither this file nor `/contacts.txt` is served by export mode, which whitelists
@@ -383,10 +399,16 @@ anyone in the room can join the access point while it is up.
 **CSV logs** — one file per day on the SD card, e.g. `/vitals_2026-08-07.csv`:
 
 ```csv
-timestamp,hr_bpm,spo2_pct,skin_c
-2026-08-07 15:59:21,134,96,
-2026-08-07 15:59:38,143,96,35.0
+timestamp,hr_bpm,spo2_pct,skin_c,beat_ms,hr_eff
+2026-08-07 15:59:21,134,96,,458,134
+2026-08-07 15:59:38,143,96,35.0,419,143
+2026-09-02 15:47:10,110,96,35.1,271,221
 ```
+
+`hr_bpm` is the wristband's own heart-rate byte and `hr_eff` is the rate the board actually used —
+the two differ on the third row, where the byte had halved and the beat interval was believed
+instead. `beat_ms` is the evidence for that decision. Files written before this existed have four
+columns and are still read correctly; the report page uses `hr_bpm` either way.
 
 Pull the card any time to browse the full history on a computer. `tools/analyze.py` gives a
 quick per-column summary of a capture/log.
@@ -419,6 +441,7 @@ firmware/
                     trace_window.h    alarm trace windowing and dropout gaps
                     hold_gesture.h    three-second hold with countdown
                     alert_log.h       /alerts.csv rows and boot reconciliation
+                    vitals_csv.h      daily log rows, written and read back (pure)
                     contacts.h        /contacts.txt parsing
                     alarm_render.h    alarm screen drawing
   reader_serial/    minimal ESP32 reader — decoded vitals over serial (no display)

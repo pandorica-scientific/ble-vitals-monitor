@@ -177,10 +177,53 @@ This matters more than any labelling question: a band that has come off and is l
 reports a plausible, reassuring heart rate rather than an obvious fault. Silence is a visible
 failure; an invented 93 bpm is not.
 
-**Implemented** in `band_protocol.h` as `bandReadingDisagrees()`, and the reading is **not**
-dropped — it is still displayed, logged and fed to the alarm, with **"reading issue"** shown under
-the heart-rate value on the live screen. Hiding a doubtful number would trade one silent failure
-for another; the point is to make the doubt visible to whoever is looking at the screen.
+**Implemented** in `band_protocol.h` as `bandReadingDisagrees()`. The reading is never dropped, and
+since the half-rate finding below it is no longer merely marked either: when the two decodes
+disagree and the interval is usable, the interval **replaces** the heart-rate byte. See
+`effectiveHeartRate()`. Where the interval is unusable the raw byte stays on screen with
+**"reading issue"** under it, because hiding a doubtful number would trade one silent failure for
+another.
+
+### The heart-rate byte also halves  ★CONFIRMED — read this one too
+
+Bedding is not the only way byte 10 lies. Worn, on a real wrist, it intermittently locks onto every
+second beat and reports half the true rate. Established from 33 days of the board's own logs
+(2026-08-07 to 2026-09-02, ~115,000 readings):
+
+| | |
+|---|---|
+| Episodes where the rate fell to 42–58% of the preceding two minutes and held for ≥2 readings | **70** |
+| Typical episode | ~160 → ~80 bpm, lasting 40 s to 5 min, then back |
+| Highest heart rate in 33 days | **191** |
+| Readings in the 60–99 band | 786 of 114,996 (0.7%), a separate lump centred on 80 |
+
+Two failures follow from one bug, and they point in opposite directions:
+
+- **A real tachycardia arrives halved and invisible.** The high alarm arms at 200 and the byte has
+  never once said more than 191. On 2026-09-02 the board showed a flat 105–120 bpm for an hour,
+  flagged as disagreeing, while the baby was unresponsive in a car seat and a parent counted 3–5
+  beats per second by ear — roughly 180–300 bpm. Doubled, the displayed 110 is 220.
+- **A halved rate arrives as bradycardia.** A real 160 shown as 80 sits exactly on the low alarm's
+  threshold. A hospital Holter over the same period recorded nothing near 80.
+
+The beat interval settles both, and it is the same field that caught the bedding readings. When the
+two decodes disagree the interval wins, because it is a measured interval rather than a tracker's
+average. It is only trusted between **150 ms (400 bpm)** and **2000 ms (30 bpm)**: infant SVT
+reaches 250–300 bpm, so the ceiling has to sit well above it, and outside that range the field is
+garbage and the raw byte is kept.
+
+> **`effectiveHeartRate(hr, beat_ms)`** = `round(60000 / beat_ms)` when the two disagree by more
+> than 40 bpm and the interval is inside that range; otherwise the raw byte. A zero heart rate
+> stays zero, so an idle band is never handed a manufactured rate.
+
+The corrected rate is what the screen, the plots, the logs and **both** alarms use. Because it is
+one step further from the sensor than the byte, a confirmation window containing any corrected
+reading is held to a higher bar: **three critical readings across 120 s** rather than two across
+60 s, and a corrected reading can never fire the implausible-collapse rule. An episode confirmed
+that way is logged and titled `CONFIRMED_HIGH_BEAT`, so it is always clear which decode raised it.
+
+The daily CSV carries `beat_ms` and `hr_eff` alongside the raw `hr_bpm` for exactly this reason:
+the correction has to remain auditable after the fact.
 
 Two smaller edges from the same run:
 

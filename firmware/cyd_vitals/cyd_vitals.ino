@@ -38,6 +38,7 @@
 #include "trace_window.h"
 #include "hold_gesture.h"
 #include "alert_log.h"
+#include "vitals_csv.h"
 #include "contacts.h"
 #include "day_night.h"     // solar dimming schedule and the backlight ramp
 #include "app_html.h"      // the report page served in export mode (PROGMEM)
@@ -65,6 +66,8 @@
 #define HR_SUSTAIN_LOW       90   // the last reading of the window must be at or below this
 #define HR_CANCEL_LOW       100   // a reading above this abandons the window
 #define CRIT_MIN_HIGH         2   // readings at or above HR_CRIT needed in one window
+#define CRIT_MIN_CORRECTED    3   // ...and when the window rests on beat-interval readings
+#define CRIT_CONFIRM_CORRECTED_MS 120000
 #define CRIT_CONFIRM_MS   60000   // confirmation window length
 #define ALARM_SNOOZE_MS  600000   // suppression after a dismissal, so the board can be carried
 #define ALARM_FLASH_MS      500   // half-period of the perimeter flash
@@ -295,12 +298,14 @@ RTC_DATA_ATTR esp_reset_reason_t g_origReason=ESP_RST_UNKNOWN;
 RTC_DATA_ATTR AlarmMachine g_alarm;
 RTC_DATA_ATTR AlarmMachine g_alarmLow;
 const AlarmConfig ALARM_CFG{HR_CRIT,HR_SUSTAIN,HR_CANCEL,HR_COLLAPSE_FROM,HR_COLLAPSE_TO,
-                            CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS};
+                            CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS,false,
+                            CRIT_MIN_CORRECTED,CRIT_CONFIRM_CORRECTED_MS};
 // Collapse thresholds are carried but unused: the collapse rule is high-side only, see
 // critical_alarm.h. The trailing true is what makes every comparison read the other way up.
 const AlarmConfig ALARM_LOW_CFG{HR_CRIT_LOW,HR_SUSTAIN_LOW,HR_CANCEL_LOW,
                                 HR_COLLAPSE_FROM,HR_COLLAPSE_TO,
-                                CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS,true};
+                                CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS,true,
+                                CRIT_MIN_CORRECTED,CRIT_CONFIRM_CORRECTED_MS};
 
 // Two machines, one screen. Whichever is latched owns the display; if somehow both are, the fast
 // one wins, because a rate above 200 needs a hospital sooner than one below 80.
@@ -461,13 +466,17 @@ uint32_t csvRowEpoch(int hh,int mm,int ss){
   tm.tm_hour=hh; tm.tm_min=mm; tm.tm_sec=ss;
   return (uint32_t)mktime(&tm);
 }
-void logRow(int hr,int spo2,float skin,bool sv){
+void logRow(int hr,int spo2,float skin,bool sv,int beatMs,int hrEff){
   if(!g_sdReady||!g_timeReady) return; struct tm tm{}; if(!readLocalClock(tm)) return;
   char fn[32]; csvName(fn,&tm); bool isNew=!SD.exists(fn);
   File f=SD.open(fn,FILE_APPEND); if(!f) return;
-  if(isNew) f.println("timestamp,hr_bpm,spo2_pct,skin_c");
+  if(isNew) f.println(VITALS_CSV_HEADER);
   char ts[24]; strftime(ts,24,"%F %T",&tm);
-  if(sv) f.printf("%s,%d,%d,%.1f\n",ts,hr,spo2,skin); else f.printf("%s,%d,%d,\n",ts,hr,spo2);
+  // hr is the band's own byte and hrEff is what the screen, the plots and the alarms used. A day
+  // that started before this firmware keeps its four-column header and gains six-column rows;
+  // parseVitalsRow() reads both, which is what makes the upgrade safe mid-day.
+  char row[80]; formatVitalsRow(row,sizeof(row),ts,hr,spo2,skin,sv,beatMs,hrEff);
+  f.println(row);
   f.close();
 }
 // /alerts.csv is append-only. Rewriting a row in place on an SD card is not crash-safe; appending
@@ -508,7 +517,9 @@ void reconcileOpenEpisode(){
   if(open.open && firingAlarm()==nullptr){
     AlarmMachine& m = open.low ? g_alarmLow : g_alarm;
     m.state=AlarmState::ALARM;
-    m.cause = open.low ? AlarmCause::CONFIRMED_LOW : AlarmCause::CONFIRMED_HIGH;
+    m.cause = open.low ? AlarmCause::CONFIRMED_LOW
+                       : (open.beat ? AlarmCause::CONFIRMED_HIGH_BEAT
+                                    : AlarmCause::CONFIRMED_HIGH);
     m.onsetEpoch=open.onsetEpoch; m.resolved=false;
     logAlert("BOOT_RESUME",0,0,"recovered from card");
   }
@@ -519,16 +530,17 @@ void loadCsvToday(){
   File f=SD.open(fn); if(!f){Serial.println("[csv] no file to load");return;}
   f.readStringUntil('\n'); int n=0;
   while(f.available()){
-    String ln=f.readStringUntil('\n'); if(ln.length()<19) continue;
-    int hh=ln.substring(11,13).toInt(), mm=ln.substring(14,16).toInt(), ss=ln.substring(17,19).toInt();
-    int c1=ln.indexOf(','); int c2=ln.indexOf(',',c1+1); int c3=ln.indexOf(',',c2+1);
-    if(c1<0||c2<0) continue;
-    int hr=ln.substring(c1+1,c2).toInt();
-    int sp=ln.substring(c2+1,c3<0?ln.length():c3).toInt();
-    addReading(hr,sp,hh*60+mm); pushHist(hr,sp,csvRowEpoch(hh,mm,ss)); n++;   // last HN kept -> ~1h sparkline survives reboot
+    String ln=f.readStringUntil('\n'); ln.trim();
+    VitalsRow row;
+    if(!parseVitalsRow(ln.c_str(),row)) continue;
+    // The charts are redrawn from the corrected rate where the file has one, and from the raw
+    // byte for every row written before the correction existed.
+    const int hr=vitalsRowHistoryHr(row);
+    addReading(hr,row.spo2,row.hh*60+row.mm);
+    pushHist(hr,row.spo2,csvRowEpoch(row.hh,row.mm,row.ss)); n++;   // last HN kept -> ~1h sparkline survives reboot
     // remember the last valid skin temp so the display holds it (like the app) instead of "--"
-    if(c3>=0){ String sf=ln.substring(c3+1); sf.trim();
-      if(sf.length()){ float sk=sf.toFloat(); if(sk>=BAND_SKIN_MIN_C&&sk<=BAND_SKIN_MAX_C){ holdSkinTemperature(sk); } } }
+    if(row.skinValid && row.skinC>=BAND_SKIN_MIN_C && row.skinC<=BAND_SKIN_MAX_C)
+      holdSkinTemperature(row.skinC);
   }
   f.close();
   ReadingSnapshot held = readSnapshot();
@@ -709,23 +721,32 @@ void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,ui
 
   char heartText[8];
   char oxygenText[8];
-  if(stale || reading.heartRate == 0) strlcpy(heartText,"--",sizeof(heartText));
-  else snprintf(heartText,sizeof(heartText),"%d",reading.heartRate);
+  const int shownHr = reading.effectiveHeartRate;
+  if(stale || shownHr == 0) strlcpy(heartText,"--",sizeof(heartText));
+  else snprintf(heartText,sizeof(heartText),"%d",shownHr);
   if(stale || reading.oxygenSaturation == 0) strlcpy(oxygenText,"--",sizeof(oxygenText));
   else snprintf(oxygenText,sizeof(oxygenText),"%d",reading.oxygenSaturation);
   // top row: big current values
-  if(full || key.heartRate!=prev.heartRate || key.stale!=prev.stale ||
+  if(full || key.effectiveHeartRate!=prev.effectiveHeartRate || key.heartRate!=prev.heartRate ||
+     key.stale!=prev.stale || key.corrected!=prev.corrected ||
      key.readingIssue!=prev.readingIssue){
-    cell(0,0,"HEART",heartText,"bpm",
-         d?DIM:((reading.heartRate&&(reading.heartRate<HR_LOW||reading.heartRate>HR_HIGH))?TFT_RED:0x6E6C));
-    // The band contradicting itself - byte 10 against its own beat interval - means the number
-    // above is doubtful, most likely read off bedding rather than a wrist. Say so under the
-    // value rather than hiding the reading: a blank is a visible fault, a wrong number is not.
-    if(key.readingIssue){
-      tft.setFont(&fonts::FreeSans9pt7b); tft.setTextSize(1);
+    // Orange for a corrected number, so a rate that came from the beat interval never looks like
+    // an ordinary reading, whether or not it happens to sit inside the safe band.
+    const uint16_t hrColour = d ? DIM
+                                : (key.corrected ? TFT_ORANGE
+                                   : ((shownHr&&(shownHr<HR_LOW||shownHr>HR_HIGH))?TFT_RED:0x6E6C));
+    cell(0,0,"HEART",heartText,"bpm",hrColour);
+    // Under the value: what the band said against what its own beat timing said. The band's byte
+    // locks onto every second beat, so the number above is often the only true one - but hiding
+    // the disagreement would hide the reason to believe it.
+    if(key.corrected || key.readingIssue){
+      char note[24];
+      if(key.corrected) snprintf(note,sizeof(note),"band %d / beat %d",reading.heartRate,shownHr);
+      else strlcpy(note,"reading issue",sizeof(note));
+      tft.setFont(&fonts::Font0); tft.setTextSize(1);
       tft.setTextColor(d?DIM:TFT_ORANGE);
       tft.setTextDatum(textdatum_t::bottom_left);
-      tft.drawString("reading issue",8,HDR+RH-4);
+      tft.drawString(note,8,HDR+RH-4);
     }
   }
   if(full || key.oxygenSaturation!=prev.oxygenSaturation || key.stale!=prev.stale)
@@ -748,7 +769,7 @@ void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,ui
 void renderLive(const ReadingSnapshot& reading,RadioState radioState){
   uint32_t ageMs=static_cast<uint32_t>(millis()-reading.lastPacketMs);
   bool stale=reading.lastPacketMs==0 || ageMs>STALE_MS;
-  uint8_t alertMask=makeAlertMask(reading.heartRate,reading.oxygenSaturation,
+  uint8_t alertMask=makeAlertMask(reading.effectiveHeartRate,reading.oxygenSaturation,
                                   stale,HR_LOW,HR_HIGH,SPO2_LOW);
   LiveRenderKey key=makeLiveRenderKey(reading,radioState,stale,alertMask,minuteOfDay());
   if(!g_renderKeyValid || key!=g_lastRenderKey){
@@ -1000,8 +1021,16 @@ void onAlarmStarted(const ReadingSnapshot& r){
   view=ALARM; setBacklight(255); g_renderKeyValid=false; g_alarmKeyValid=false;
   const AlarmMachine* m=firingAlarm();
   const AlarmCause cause = m ? m->cause : AlarmCause::NONE;
-  logAlert("ONSET",r.heartRate,r.oxygenSaturation,alarmCauseName(cause));
-  Serial.printf("[alarm] %s hr=%d\n",alarmCauseName(cause),r.heartRate);
+  // The cause name stays the first token of the detail column: reconcileAlertLine() matches on it.
+  char detail[48];
+  if(r.heartRateCorrected)
+    snprintf(detail,sizeof(detail),"%s band=%d beat=%dms",alarmCauseName(cause),
+             r.heartRate,r.beatMs);
+  else
+    snprintf(detail,sizeof(detail),"%s",alarmCauseName(cause));
+  logAlert("ONSET",r.effectiveHeartRate,r.oxygenSaturation,detail);
+  Serial.printf("[alarm] %s hr=%d band=%d beat=%d\n",alarmCauseName(cause),
+                r.effectiveHeartRate,r.heartRate,r.beatMs);
 }
 
 void leaveAlarmView(){
@@ -1017,7 +1046,7 @@ void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool 
 
   if(hold.completed){
     if(!g_selfTest){
-      logAlert("DISMISS",reading.heartRate,reading.oxygenSaturation,"dismissed");
+      logAlert("DISMISS",reading.effectiveHeartRate,reading.oxygenSaturation,"dismissed");
       // Both, always. One hold silences the screen, so it has to silence what put it there and
       // snooze the other side too - otherwise dismissing a low alarm can be followed a second
       // later by a high one from the same run of doubtful readings.
@@ -1035,7 +1064,8 @@ void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool 
   AlarmMachine* firing=firingAlarm();
   a.machine = firing ? firing : &g_alarm;    // self-test borrows the high machine's empty state
   a.contacts=&g_contacts;
-  a.heartRate=reading.heartRate; a.oxygen=reading.oxygenSaturation;
+  a.heartRate=reading.effectiveHeartRate; a.rawHeartRate=reading.heartRate;
+  a.corrected=reading.heartRateCorrected; a.oxygen=reading.oxygenSaturation;
   a.oxygenAgeMin = (g_spo2StampEpoch && nowE>=g_spo2StampEpoch)
                      ? static_cast<int>((nowE-g_spo2StampEpoch)/60) : -1;
   a.elapsedS = g_selfTest ? 0 : alarmElapsedS(*a.machine,nowE);
@@ -1046,7 +1076,8 @@ void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool 
   // Three independent repaints, so the fastest-changing thing does not drag the slowest through
   // a redraw: the vitals and trace only when a new reading lands (~20 s), the timer once a
   // second in its own corner, the frame twice a second as six thin rectangles.
-  const int key = reading.sequence*7 + reading.heartRate + reading.oxygenSaturation*3
+  const int key = reading.sequence*7 + reading.effectiveHeartRate + reading.heartRate*11
+                  + reading.oxygenSaturation*3
                   + (stale?9001:0) + static_cast<int>(radioState)*37;
   if(!g_alarmKeyValid || key!=g_alarmKey){
     g_alarmKey=key; g_alarmKeyValid=true;
@@ -1054,7 +1085,7 @@ void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool 
     // Evidence for "the trace looks frozen": prints once per repaint, so the interval between
     // lines is the real reading cadence and hist/timed say whether the trace has a time axis.
     Serial.printf("[alarm] draw hr=%d spo2=%d seq=%d hist=%d timed=%d age=%lus\n",
-                  reading.heartRate,reading.oxygenSaturation,reading.sequence,histCnt,
+                  reading.effectiveHeartRate,reading.oxygenSaturation,reading.sequence,histCnt,
                   tracePositional(histEpoch,histCnt)?0:1,
                   (unsigned long)(reading.lastPacketMs?(millis()-reading.lastPacketMs)/1000:0));
   }
@@ -1149,11 +1180,16 @@ void loop(){
       lastAlarmSeq=reading.sequence;
       const uint32_t nowE=nowEpochOrZero();      // one clock read per reading, not three
       if(reading.oxygenSaturation>0) g_spo2StampEpoch=nowE;
-      AlarmEvent ev=alarmOnReading(g_alarm,ALARM_CFG,reading.heartRate,millis(),nowE);
-      AlarmEvent evLow=alarmOnReading(g_alarmLow,ALARM_LOW_CFG,reading.heartRate,millis(),nowE);
+      // Both machines see the corrected rate. That is the whole point: a halved 160 arriving as
+      // 80 must not raise a bradycardia alarm, and a true 220 arriving as 110 must still raise a
+      // tachycardia one.
+      AlarmEvent ev=alarmOnReading(g_alarm,ALARM_CFG,reading.effectiveHeartRate,millis(),nowE,
+                                   reading.heartRateCorrected);
+      AlarmEvent evLow=alarmOnReading(g_alarmLow,ALARM_LOW_CFG,reading.effectiveHeartRate,
+                                      millis(),nowE,reading.heartRateCorrected);
       if(ev.alarmStarted||evLow.alarmStarted) onAlarmStarted(reading);
       if(ev.episodeResolved||evLow.episodeResolved)
-        logAlert("RESOLVED",reading.heartRate,reading.oxygenSaturation,"");
+        logAlert("RESOLVED",reading.effectiveHeartRate,reading.oxygenSaturation,"");
     }
     AlarmEvent tick=alarmTick(g_alarm,ALARM_CFG,millis(),stale);
     AlarmEvent tickLow=alarmTick(g_alarmLow,ALARM_LOW_CFG,millis(),stale);
@@ -1179,9 +1215,11 @@ void loop(){
   if(reading.sequence!=lastLogged && reading.lastPacketMs != 0 &&
      static_cast<uint32_t>(millis()-reading.lastPacketMs)<3000){
     lastLogged=reading.sequence;
-    logRow(reading.heartRate,reading.oxygenSaturation,reading.skinC,reading.skinValid);
-    int mod=minuteOfDay(); if(mod>=0) addReading(reading.heartRate,reading.oxygenSaturation,mod);
-    pushHist(reading.heartRate,reading.oxygenSaturation,nowEpochOrZero());  // feed the 1-hour sparklines
+    logRow(reading.heartRate,reading.oxygenSaturation,reading.skinC,reading.skinValid,
+           reading.beatMs,reading.effectiveHeartRate);
+    int mod=minuteOfDay();
+    if(mod>=0) addReading(reading.effectiveHeartRate,reading.oxygenSaturation,mod);
+    pushHist(reading.effectiveHeartRate,reading.oxygenSaturation,nowEpochOrZero());  // 1-hour sparklines
   }
   delay(g_touching?15:60);                       // sample faster mid-gesture so swipes track well
 }

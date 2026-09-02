@@ -14,6 +14,7 @@ inline const char* alarmCauseName(AlarmCause cause) {
   switch (cause) {
     case AlarmCause::CONFIRMED_HIGH: return "CONFIRMED_HIGH";
     case AlarmCause::CONFIRMED_LOW: return "CONFIRMED_LOW";
+    case AlarmCause::CONFIRMED_HIGH_BEAT: return "CONFIRMED_HIGH_BEAT";
     case AlarmCause::LOST_WHILE_CRITICAL: return "LOST_WHILE_CRITICAL";
     case AlarmCause::IMPLAUSIBLE_COLLAPSE: return "IMPLAUSIBLE_COLLAPSE";
     case AlarmCause::NONE: break;
@@ -31,6 +32,7 @@ inline void formatAlertRow(char* out, size_t cap, const char* timestamp, const c
 struct OpenEpisode {
   bool open = false;
   bool low = false;          // the ONSET row named CONFIRMED_LOW
+  bool beat = false;         // ...or CONFIRMED_HIGH_BEAT
   uint32_t onsetEpoch = 0;
 };
 
@@ -51,12 +53,14 @@ inline void reconcileAlertLine(const char* line, uint32_t lineEpoch, OpenEpisode
     // way the heart rate went. Getting this wrong would put "HIGH HEART RATE" on the screen for a
     // bradycardia episode, which is worse than saying nothing.
     state.low = strstr(event, "CONFIRMED_LOW") != nullptr;
+    state.beat = strstr(event, "CONFIRMED_HIGH_BEAT") != nullptr;
     state.onsetEpoch = lineEpoch;
     return;
   }
   if (len == 7 && strncmp(event, "DISMISS", 7) == 0) {
     state.open = false;
     state.low = false;
+    state.beat = false;
     state.onsetEpoch = 0;
   }
   // RESOLVED and BOOT_RESUME deliberately do not change openness: the alarm latches until

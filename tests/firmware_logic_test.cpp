@@ -5,6 +5,7 @@
 #include "../firmware/cyd_vitals/alert_log.h"
 #include "../firmware/cyd_vitals/contacts.h"
 #include "../firmware/cyd_vitals/live_render_key.h"
+#include "../firmware/cyd_vitals/vitals_csv.h"
 #include "../firmware/cyd_vitals/radio_health.h"
 #include "../firmware/cyd_vitals/wifi_failover.h"
 #include "../firmware/cyd_vitals/day_night.h"
@@ -259,20 +260,39 @@ static void testLiveRenderKey() {
 
 // Feed readings 20 s apart while ticking every second, exactly as the main loop does, and run
 // long enough for at least one confirmation window to close.
-static AlarmMachine runWindow(const AlarmConfig& cfg, const std::vector<int>& readings) {
+// A reading plus whether it came from the beat interval, so a window can mix the two.
+struct WindowReading {
+  int hr;
+  bool corrected;
+};
+
+static AlarmMachine runWindow(const AlarmConfig& cfg, const std::vector<WindowReading>& readings) {
   AlarmMachine m{};
   const uint32_t epoch0 = 1'000'000;
   uint32_t endMs = static_cast<uint32_t>(readings.size()) * 20'000;
-  if (endMs < cfg.confirmMs) endMs = cfg.confirmMs;
+  // A corrected window is twice as long, so the harness has to outlast it - but only when the
+  // readings actually are corrected. Running a raw window past its 60 s would hand it a second
+  // confirmation window it would never get in the loop, and quietly change what these tests mean.
+  bool anyCorrected = false;
+  for (const WindowReading& r : readings) anyCorrected = anyCorrected || r.corrected;
+  const uint32_t minEnd = anyCorrected ? cfg.confirmMsCorrected : cfg.confirmMs;
+  if (endMs < minEnd) endMs = minEnd;
   endMs += 1'000;
   for (uint32_t t = 0; t <= endMs; t += 1'000) {
     const size_t idx = t / 20'000;
     if (t % 20'000 == 0 && idx < readings.size()) {
-      alarmOnReading(m, cfg, readings[idx], t, epoch0 + t / 1000);
+      alarmOnReading(m, cfg, readings[idx].hr, t, epoch0 + t / 1000, readings[idx].corrected);
     }
     alarmTick(m, cfg, t, false);
   }
   return m;
+}
+
+static AlarmMachine runWindow(const AlarmConfig& cfg, const std::vector<int>& readings) {
+  std::vector<WindowReading> raw;
+  raw.reserve(readings.size());
+  for (int hr : readings) raw.push_back({hr, false});
+  return runWindow(cfg, raw);
 }
 
 // The same machine with its thresholds read the other way up: arms at or below 80, confirms at
@@ -902,6 +922,188 @@ static void testBrightnessRamp() {
   }
 }
 
+// The band's heart-rate byte locks onto every second beat. Across 33 days of logs the rate fell to
+// almost exactly half of the preceding two minutes 70 times, and never once read above 191 - so a
+// true tachycardia arrives halved and invisible, and a real 160 arrives as an 80 that looks like
+// bradycardia. The beat interval settles both, inside a range no human heart leaves.
+static void testEffectiveHeartRate() {
+  // Agreement leaves the reading exactly alone.
+  expect(effectiveHeartRate(108, 560) == 108, "108 bpm against a 560 ms interval is untouched");
+  expect(!readingCorrected(108, 560), "an agreeing reading is not marked corrected");
+  expect(effectiveHeartRate(133, 451) == 133, "a genuine infant reading is untouched");
+
+  // The halving this whole change exists for: 80 shown, 375 ms measured, 160 true.
+  expect(effectiveHeartRate(80, 375) == 160, "a halved 80 is corrected to 160");
+  expect(readingCorrected(80, 375), "the halved reading is marked corrected");
+  // The 2026-09-02 episode: ~110 on screen, an interval implying well over 200.
+  expect(effectiveHeartRate(110, 271) == 221, "110 bpm against a 271 ms interval reads 221");
+  expect(effectiveHeartRate(115, 260) == 231, "a 260 ms interval reads 231, above HR_CRIT");
+
+  // The bedding readings from 2026-08-26 are corrected by the same rule.
+  expect(effectiveHeartRate(93, 400) == 150, "a fabric reading is corrected, not merely marked");
+
+  // Outside the plausible interval range the field is garbage and the raw byte survives.
+  expect(effectiveHeartRate(200, 50) == 200, "a 50 ms interval (1200 bpm) is rejected");
+  expect(effectiveHeartRate(200, 149) == 200, "just under 150 ms is rejected");
+  expect(effectiveHeartRate(120, 2001) == 120, "just over 2000 ms is rejected");
+  expect(effectiveHeartRate(200, 0) == 200, "a missing interval cannot correct anything");
+  expect(!readingCorrected(200, 50), "a rejected interval leaves the reading unmarked");
+
+  // A band with no pulse must never be handed a manufactured rate.
+  expect(effectiveHeartRate(0, 375) == 0, "an idle band stays at zero");
+  expect(!readingCorrected(0, 375), "the charging beacon is not corrected");
+
+  // Rounding is to nearest, not toward zero: 60000/271 is 221.4.
+  expect(effectiveHeartRate(110, 271) == (60000 + 271 / 2) / 271, "the correction rounds to nearest");
+
+  // The boundaries themselves are inside the range.
+  expect(effectiveHeartRate(100, 150) == 400, "150 ms is accepted and reads 400 bpm");
+  expect(effectiveHeartRate(100, 2000) == 30, "2000 ms is accepted and reads 30 bpm");
+}
+
+// A window holding any beat-derived reading needs three critical readings across 120 s instead of
+// two across 60 s. Same thresholds, same latch: only the burden of proof moves.
+static void testCorrectedWindow() {
+  AlarmConfig cfg{};
+
+  {
+    // Six corrected readings at or above crit, held there: confirmed, and named as beat-derived.
+    AlarmMachine m = runWindow(cfg, std::vector<WindowReading>{
+        {206, true}, {205, true}, {205, true}, {205, true}, {205, true}, {205, true}});
+    expect(m.state == AlarmState::ALARM, "a sustained corrected rate alarms");
+    expect(m.cause == AlarmCause::CONFIRMED_HIGH_BEAT, "the cause names the beat interval");
+    expect(m.windowCorrected, "the window is marked corrected");
+  }
+
+  {
+    // Two corrected readings inside the first 60 s are not enough, where two raw ones would be.
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 205, 0, 1'000'000, true);
+    alarmOnReading(m, cfg, 205, 20'000, 1'000'020, true);
+    alarmTick(m, cfg, 61'000, false);
+    expect(m.state == AlarmState::ARMED, "two corrected readings do not confirm at 60 s");
+    AlarmMachine raw{};
+    alarmOnReading(raw, cfg, 205, 0, 1'000'000);
+    alarmOnReading(raw, cfg, 205, 20'000, 1'000'020);
+    alarmTick(raw, cfg, 61'000, false);
+    expect(raw.state == AlarmState::ALARM, "two raw readings still confirm at 60 s");
+    expect(raw.cause == AlarmCause::CONFIRMED_HIGH, "a raw window keeps the plain cause");
+  }
+
+  {
+    // A rate falling strictly back through the window is resolving, and is not confirmed.
+    AlarmMachine m = runWindow(cfg, std::vector<WindowReading>{
+        {206, true}, {205, true}, {199, true}, {198, true}, {197, true}, {196, true}});
+    expect(m.state == AlarmState::ARMED, "a strictly falling corrected rate does not alarm");
+  }
+
+  {
+    // One corrected reading is enough to widen a window that is otherwise raw.
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 205, 0, 1'000'000, false);
+    alarmOnReading(m, cfg, 205, 20'000, 1'000'020, true);
+    alarmTick(m, cfg, 61'000, false);
+    expect(m.state == AlarmState::ARMED, "one corrected reading widens the window to 120 s");
+    alarmOnReading(m, cfg, 205, 80'000, 1'000'080, true);
+    alarmTick(m, cfg, 121'000, false);
+    expect(m.state == AlarmState::ALARM, "three readings across 120 s confirm");
+    expect(m.cause == AlarmCause::CONFIRMED_HIGH_BEAT, "a mixed window is named beat-derived");
+  }
+
+  {
+    // Cancel still works, and a raw reading below cancel ends a corrected window outright.
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 205, 0, 1'000'000, true);
+    alarmOnReading(m, cfg, 205, 20'000, 1'000'020, true);
+    alarmOnReading(m, cfg, 130, 40'000, 1'000'040, false);
+    expect(m.state == AlarmState::IDLE, "a reading below cancel abandons a corrected window");
+    expect(!m.windowCorrected, "an abandoned window forgets it was corrected");
+  }
+
+  {
+    // The collapse rule must not fire on a corrected reading: one long interval would otherwise
+    // turn a normal rate into an instant alarm with no window to catch it.
+    AlarmMachine m{};
+    alarmOnReading(m, cfg, 190, 0, 1'000'000, false);
+    alarmOnReading(m, cfg, 40, 20'000, 1'000'020, true);
+    expect(m.state == AlarmState::IDLE, "a corrected reading cannot fire the collapse rule");
+    AlarmMachine rawCollapse{};
+    alarmOnReading(rawCollapse, cfg, 190, 0, 1'000'000, false);
+    alarmOnReading(rawCollapse, cfg, 40, 20'000, 1'000'020, false);
+    expect(rawCollapse.state == AlarmState::ALARM, "a raw collapse still alarms");
+    expect(rawCollapse.cause == AlarmCause::IMPLAUSIBLE_COLLAPSE, "and is named a collapse");
+  }
+
+  {
+    // Dismissal snoozes a corrected episode exactly as it snoozes a raw one.
+    AlarmMachine m = runWindow(cfg, std::vector<WindowReading>{
+        {206, true}, {205, true}, {205, true}, {205, true}, {205, true}, {205, true}});
+    expect(m.state == AlarmState::ALARM, "the corrected episode alarmed");
+    alarmDismiss(m, 200'000);
+    expect(m.state == AlarmState::IDLE, "dismissal clears it");
+    for (uint32_t t = 220'000; t <= 400'000; t += 20'000) {
+      alarmOnReading(m, cfg, 205, t, 1'000'000 + t / 1000, true);
+      alarmTick(m, cfg, t, false);
+    }
+    expect(m.state != AlarmState::ALARM, "the snooze holds a corrected alarm too");
+  }
+
+  // The halved reading that used to trip the bradycardia alarm no longer reaches it.
+  {
+    AlarmConfig low = lowConfig();
+    const int corrected = effectiveHeartRate(80, 375);
+    AlarmMachine m = runWindow(low, std::vector<WindowReading>{
+        {corrected, true}, {corrected, true}, {corrected, true}, {corrected, true}});
+    expect(m.state == AlarmState::IDLE, "a halved 80 corrected to 160 never arms the low alarm");
+    // A genuinely slow heart still does: both decodes agree, so nothing is corrected.
+    AlarmMachine real = runWindow(low, std::vector<int>{78, 76, 75, 74, 74, 74});
+    expect(real.state == AlarmState::ALARM, "a real bradycardia still alarms");
+    expect(real.cause == AlarmCause::CONFIRMED_LOW, "and is named a low episode");
+  }
+}
+
+// The daily log gained beat_ms and hr_eff. The parser has to read the rows written before they
+// existed, including the mixed file that upgrade day leaves behind.
+static void testVitalsCsv() {
+  char row[80];
+  formatVitalsRow(row, sizeof(row), "2026-09-02 15:59:38", 143, 96, 35.0f, true, 375, 160);
+  expect(std::string(row) == "2026-09-02 15:59:38,143,96,35.0,375,160", "a full row formats");
+  formatVitalsRow(row, sizeof(row), "2026-09-02 15:59:38", 143, 96, 0.0f, false, 0, 143);
+  expect(std::string(row) == "2026-09-02 15:59:38,143,96,,0,143", "an invalid skin leaves a hole");
+
+  VitalsRow parsed{};
+  expect(parseVitalsRow("2026-09-02 15:59:38,143,96,35.0,375,160", parsed), "a full row parses");
+  expect(parsed.hh == 15 && parsed.mm == 59 && parsed.ss == 38, "the clock is read by offset");
+  expect(parsed.hr == 143 && parsed.spo2 == 96, "raw rate and oxygen");
+  expect(parsed.skinValid && std::fabs(parsed.skinC - 35.0f) < 0.01f, "skin stops at the comma");
+  expect(parsed.beatMs == 375 && parsed.hrEff == 160, "beat interval and corrected rate");
+  expect(parsed.haveEff, "the row carries a corrected rate");
+  expect(vitalsRowHistoryHr(parsed) == 160, "the charts plot the corrected rate");
+
+  VitalsRow old{};
+  expect(parseVitalsRow("2026-08-07 15:59:38,134,96,35.0", old), "a four-column row parses");
+  expect(old.hr == 134 && old.skinValid && std::fabs(old.skinC - 35.0f) < 0.01f,
+         "the old row's skin is not swallowed");
+  expect(!old.haveEff, "an old row has no corrected rate");
+  expect(vitalsRowHistoryHr(old) == 134, "and is plotted from the raw byte");
+
+  VitalsRow noSkin{};
+  expect(parseVitalsRow("2026-08-07 15:59:21,134,96,", noSkin), "an empty skin column parses");
+  expect(!noSkin.skinValid, "and is not mistaken for a temperature");
+
+  VitalsRow emptySkinWide{};
+  expect(parseVitalsRow("2026-09-02 16:00:00,110,97,,271,221", emptySkinWide),
+         "an empty skin column in a wide row parses");
+  expect(!emptySkinWide.skinValid, "still no temperature");
+  expect(emptySkinWide.beatMs == 271 && emptySkinWide.hrEff == 221, "the later columns still land");
+
+  VitalsRow bad{};
+  expect(!parseVitalsRow("timestamp,hr_bpm,spo2_pct,skin_c,beat_ms,hr_eff", bad),
+         "the header is not a reading");
+  expect(!parseVitalsRow("", bad), "an empty line is not a reading");
+  expect(!parseVitalsRow("2026-09-02 15:59", bad), "a truncated line is not a reading");
+}
+
 int main() {
   testSolarTimes();
   testUtcOffsetRecovery();
@@ -910,7 +1112,10 @@ int main() {
   testBrightnessRamp();
   testBandDecoder();
   testReadingDisagreement();
+  testEffectiveHeartRate();
   testLowAlarm();
+  testCorrectedWindow();
+  testVitalsCsv();
   testReadingMerge();
   testRadioHealth();
   testWifiFailover();
