@@ -119,19 +119,23 @@ const hrDay = sandbox.summarise("/vitals_2026-08-11.csv", hrCsv);
 assert.equal(hrDay.loHrMin, 2 * 20 / 60, "two readings below 90 should be two sample intervals");
 assert.equal(hrDay.hiHrMin, 2 * 20 / 60, "180 and above should count as above 179");
 
-// The board now writes beat_ms and hr_eff after skin_c. The report reads the raw hr_bpm column and
-// must simply ignore the extra ones, including in a file whose earlier rows are four columns wide.
+// The board writes beat_ms and hr_eff after skin_c. The report plots hr_eff - the rate the screen
+// showed - wherever a row has one, and falls back to the raw byte for rows written before the
+// column existed or left it empty, including in a file whose earlier rows are four columns wide.
 const wideCsv = [
   "timestamp,hr_bpm,spo2_pct,skin_c,beat_ms,hr_eff",
   "2026-09-02 01:00:00,85,97,36.5",
   "2026-09-02 01:00:20,110,97,36.5,271,221",
   "2026-09-02 01:00:40,120,97,,0,120",
+  "2026-09-02 01:01:00,140,97,36.5,430,",
   "",
 ].join("\n");
 const wideDay = sandbox.summarise("/vitals_2026-09-02.csv", wideCsv);
-assert.equal(wideDay.n, 3, "every row of a widened file should be counted");
-assert.equal(wideDay.hr.med, 110, "the report should keep reading the raw heart-rate column");
-assert.equal(wideDay.hr.max, 120, "extra columns should not disturb the heart-rate range");
+assert.equal(wideDay.n, 4, "every row of a widened file should be counted");
+assert.equal(wideDay.hr.med, 130, "the report should plot the rate the screen showed");
+assert.equal(wideDay.hr.max, 221, "a corrected rate should reach the range");
+assert.equal(wideDay.raw.h[1], 221, "the per-reading series should carry the corrected rate");
+assert.equal(wideDay.raw.h[3], 140, "an empty hr_eff should fall back to the raw byte");
 assert.equal(wideDay.ox.med, 97, "oxygen should survive the extra columns");
 assert.match(html, /Daily detail/, "daily detail table should exist");
 assert.match(script, /HR &lt;'\+HR_LOW/, "table should carry a low heart-rate column");

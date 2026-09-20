@@ -117,7 +117,10 @@ function summarise(name,text){
   for(i=0;i<lines.length;i++){
     var ln=lines[i]; if(!ln||ln[0]==="t") continue;
     var p=ln.split(",");  if(p.length<3) continue;
-    var t=p[0], h=+p[1], o=+p[2], s=p[3]===""||p[3]===undefined?NaN:+p[3];
+    // hr_eff (sixth column) is the rate the board's screen showed; rows written before it
+    // existed, or with the column empty, fall back to the band's raw heart-rate byte.
+    var t=p[0], h=(p.length>=6&&p[5]!==""&&+p[5]>0)?+p[5]:+p[1], o=+p[2];
+    var s=p[3]===""||p[3]===undefined?NaN:+p[3];
     var hh=+t.substr(11,2), mm=+t.substr(14,2), sec=+t.substr(17,2);
     if(isNaN(hh)||isNaN(mm)) continue;
     if(isNaN(sec)) sec=0;

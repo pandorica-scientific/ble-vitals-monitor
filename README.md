@@ -233,15 +233,19 @@ single snooze to reason about rather than two that can drift apart. Two differen
   rate jumping to a very fast one — has no such justification, and against a wristband that will
   manufacture numbers off bedding it would wake the house for an artifact.
 
-- **A rate corrected from the beat interval is held to a higher bar.** The wristband's heart-rate
-  byte intermittently locks onto every second beat and reports half the truth — 70 times in 33
-  days of logs, and it has never once read above 191. The band also broadcasts the interval between
-  beats, so when the two contradict each other the interval wins and the corrected rate is what the
-  screen, the plots and both alarms use. Because that number is one step further from the sensor,
-  a window containing any corrected reading needs **three readings across two minutes** rather than
-  two across one, and a corrected reading can never trigger the collapse rule above. An episode
-  confirmed this way is titled **HIGH RATE (beat)** and logged as `CONFIRMED_HIGH_BEAT`, so it is
-  always clear which decode raised it. See `docs/PROTOCOL.md`.
+- **When the wristband contradicts itself, the recent past decides what is shown, and the fast
+  alarm hears the faster decode.** Both of the band's heart-rate decodes — its heart-rate byte and
+  its beat interval — intermittently lock onto every second beat, independently of each other: in
+  18 days of logs the byte halved 368 times and the interval doubled 389 times. When the two
+  disagree, the screen, the plots, the log and the **slow** alarm take whichever candidate is
+  nearer the median of the last five minutes of agreeing readings (the byte, until there are three
+  of them). The **fast** alarm additionally hears the interval whenever it is the faster candidate,
+  so a tachycardia that starts abruptly while the byte halves is still counted. A number that came
+  from the interval is one step further from the sensor, so a window containing any such reading
+  needs **three readings across two minutes** rather than two across one, and such a reading can
+  never trigger the collapse rule above. An episode confirmed this way is titled
+  **HIGH RATE (beat)** and logged as `CONFIRMED_HIGH_BEAT`, so it is always clear which decode
+  raised it. See `docs/PROTOCOL.md`.
 
 Dismissing silences both sides at once: one hold, one snooze.
 
@@ -295,7 +299,8 @@ timestamp,event,hr_bpm,spo2_pct,detail
 2026-09-02 15:47:10,ONSET,221,96,CONFIRMED_HIGH_BEAT band=110 beat=271ms
 ```
 
-`hr_bpm` here is the rate the alarm acted on. When that rate came from the beat interval the detail
+`hr_bpm` here is the rate the alarm acted on, which for the fast alarm can be the beat interval's
+rate even while the screen kept the band's byte. When that rate came from the interval the detail
 column keeps the band's own number and the interval behind it, so the episode can be checked later
 against the daily log.
 
@@ -408,7 +413,8 @@ timestamp,hr_bpm,spo2_pct,skin_c,beat_ms,hr_eff
 `hr_bpm` is the wristband's own heart-rate byte and `hr_eff` is the rate the board actually used —
 the two differ on the third row, where the byte had halved and the beat interval was believed
 instead. `beat_ms` is the evidence for that decision. Files written before this existed have four
-columns and are still read correctly; the report page uses `hr_bpm` either way.
+columns and are still read correctly; the report page plots `hr_eff` where a row has one and
+`hr_bpm` otherwise.
 
 Pull the card any time to browse the full history on a computer. `tools/analyze.py` gives a
 quick per-column summary of a capture/log.

@@ -86,6 +86,7 @@ static void testReadingDisagreement() {
 }
 
 static void testReadingMerge() {
+  RateContext context{};
   ReadingSnapshot previous{};
   previous.sequence = 44;
   previous.skinC = 36.8f;
@@ -99,18 +100,65 @@ static void testReadingMerge() {
   frame.skinC = 10.0f;
   frame.skinValid = false;
 
-  ReadingSnapshot next = mergeBandReading(previous, frame, -70, 12'345);
+  ReadingSnapshot next = mergeBandReading(previous, frame, -70, 12'345, context);
   expect(next.sequence == 45 && next.heartRate == 108, "new vitals are published together");
   expect(next.oxygenSaturation == 98 && next.signal == 4,
          "oxygen and signal belong to the same packet");
   expect(next.skinValid && std::fabs(next.skinC - 36.8f) < 0.01f, "invalid skin preserves held value");
   expect(next.rssi == -70 && next.lastPacketMs == 12'345, "metadata belongs to the same packet");
+  expect(next.effectiveHeartRate == 108 && !next.heartRateCorrected,
+         "an agreeing reading is shown as it is");
+  expect(next.highAlarmHeartRate == 108, "and is its own alarm input");
 
   frame.skinC = 37.2f;
   frame.skinValid = true;
-  ReadingSnapshot warm = mergeBandReading(next, frame, -68, 12'500);
+  ReadingSnapshot warm = mergeBandReading(next, frame, -68, 12'500, context);
   expect(warm.skinValid && std::fabs(warm.skinC - 37.2f) < 0.01f,
          "valid skin replaces the held value");
+  expect(context.count == 1, "a rebroadcast of the same measurement is noted once");
+
+  // Agreeing measurements build the context. After three of them a halved byte is corrected, a
+  // doubled interval is ignored, and the decision holds across rebroadcasts of the same sequence.
+  RateContext ctx{};
+  ReadingSnapshot snap{};
+  BandReading m{};
+  m.heartRate = 160;
+  m.beatMs = 375;
+  uint32_t t = 0;
+  for (uint8_t seq = 1; seq <= 3; ++seq) {
+    m.sequence = seq;
+    snap = mergeBandReading(snap, m, -60, t, ctx);
+    t += 20'000;
+  }
+  expect(ctx.count == 3, "three measurements are three context entries");
+  m.sequence = 4;
+  m.heartRate = 80;                       // the byte halves while the interval holds at 375 ms
+  snap = mergeBandReading(snap, m, -60, t, ctx);
+  expect(snap.effectiveHeartRate == 160 && snap.heartRateCorrected, "a halved byte is corrected");
+  expect(snap.highAlarmHeartRate == 160, "and the alarm hears the same rate");
+  expect(ctx.count == 3, "a disagreeing measurement does not enter the context");
+  snap = mergeBandReading(snap, m, -61, t + 1'500, ctx);
+  expect(snap.effectiveHeartRate == 160 && snap.heartRateCorrected,
+         "a rebroadcast keeps the decision");
+  t += 20'000;
+  m.sequence = 5;
+  m.heartRate = 160;
+  m.beatMs = 750;                         // now the interval doubles while the byte holds
+  snap = mergeBandReading(snap, m, -60, t, ctx);
+  expect(snap.effectiveHeartRate == 160 && !snap.heartRateCorrected,
+         "a doubled interval is ignored");
+  expect(snap.highAlarmHeartRate == 160, "and does not feed the alarm");
+
+  // Before any context exists the byte stands even when the interval contradicts it - but the
+  // alarm still hears the faster decode.
+  RateContext empty{};
+  ReadingSnapshot fresh{};
+  m.sequence = 9;
+  m.heartRate = 80;
+  m.beatMs = 375;
+  fresh = mergeBandReading(fresh, m, -60, 0, empty);
+  expect(fresh.effectiveHeartRate == 80 && !fresh.heartRateCorrected, "no context keeps the byte");
+  expect(fresh.highAlarmHeartRate == 160, "but the alarm still hears the faster decode");
 }
 
 static void testRadioHealth() {
@@ -256,6 +304,40 @@ static void testLiveRenderKey() {
   second = first;
   second.minuteKey++;
   expect(first != second, "new minute redraws clock");
+  second = first;
+  second.intervalHeartRate++;
+  expect(first != second, "a changed interval rate redraws the heart cell");
+
+  // When the byte is kept despite a disagreeing interval, the cell says so and carries the
+  // interval's own rate for the note. A corrected reading is not also an issue. An unusable
+  // interval is an issue with no rate to show.
+  ReadingSnapshot kept{};
+  kept.sequence = 46;
+  kept.heartRate = 126;
+  kept.beatMs = 880;
+  kept.effectiveHeartRate = 126;
+  kept.highAlarmHeartRate = 126;
+  LiveRenderKey keptKey = makeLiveRenderKey(kept, RadioState::RECEIVING, false, ALERT_NONE, 610);
+  expect(keptKey.readingIssue && !keptKey.corrected, "a kept byte under a doubled interval is an issue");
+  expect(keptKey.intervalHeartRate == 68, "the interval's own rate is carried for the note");
+
+  ReadingSnapshot corrected{};
+  corrected.heartRate = 83;
+  corrected.beatMs = 352;
+  corrected.effectiveHeartRate = 170;
+  corrected.heartRateCorrected = true;
+  corrected.highAlarmHeartRate = 170;
+  LiveRenderKey ck = makeLiveRenderKey(corrected, RadioState::RECEIVING, false, ALERT_NONE, 610);
+  expect(ck.corrected && !ck.readingIssue, "a corrected reading is not also an issue");
+  expect(ck.intervalHeartRate == 170, "and carries the interval rate it shows");
+
+  ReadingSnapshot garbage{};
+  garbage.heartRate = 200;
+  garbage.beatMs = 50;
+  garbage.effectiveHeartRate = 200;
+  garbage.highAlarmHeartRate = 200;
+  LiveRenderKey gk = makeLiveRenderKey(garbage, RadioState::RECEIVING, false, ALERT_NONE, 610);
+  expect(gk.readingIssue && gk.intervalHeartRate == 0, "an unusable interval is an issue with no rate");
 }
 
 // Feed readings 20 s apart while ticking every second, exactly as the main loop does, and run
@@ -926,39 +1008,113 @@ static void testBrightnessRamp() {
 // almost exactly half of the preceding two minutes 70 times, and never once read above 191 - so a
 // true tachycardia arrives halved and invisible, and a real 160 arrives as an 80 that looks like
 // bradycardia. The beat interval settles both, inside a range no human heart leaves.
-static void testEffectiveHeartRate() {
-  // Agreement leaves the reading exactly alone.
-  expect(effectiveHeartRate(108, 560) == 108, "108 bpm against a 560 ms interval is untouched");
-  expect(!readingCorrected(108, 560), "an agreeing reading is not marked corrected");
-  expect(effectiveHeartRate(133, 451) == 133, "a genuine infant reading is untouched");
+// The two decodes fail independently. Eighteen days of six-column logs (64,633 readings,
+// 2026-09-02 to 2026-09-20) hold 757 disagreements of more than 40 bpm: 368 with the interval the
+// higher of the two and 389 with it the lower. Whichever decode is continuous with the last five
+// minutes of agreeing readings is the one to show.
+static void testRateContext() {
+  RateContext c{};
+  int ref = 0;
+  expect(!rateContextReference(c, 0, ref), "an empty context offers no reference");
+  rateContextNote(c, 120, 0);
+  rateContextNote(c, 124, 20'000);
+  expect(!rateContextReference(c, 40'000, ref), "two readings are not a reference");
+  rateContextNote(c, 122, 40'000);
+  expect(rateContextReference(c, 60'000, ref) && ref == 122, "three readings give their median");
+  rateContextNote(c, 160, 60'000);
+  expect(rateContextReference(c, 80'000, ref) && ref == 123, "an even count averages the middle pair");
 
-  // The halving this whole change exists for: 80 shown, 375 ms measured, 160 true.
-  expect(effectiveHeartRate(80, 375) == 160, "a halved 80 is corrected to 160");
-  expect(readingCorrected(80, 375), "the halved reading is marked corrected");
-  // The 2026-09-02 episode: ~110 on screen, an interval implying well over 200.
-  expect(effectiveHeartRate(110, 271) == 221, "110 bpm against a 271 ms interval reads 221");
-  expect(effectiveHeartRate(115, 260) == 231, "a 260 ms interval reads 231, above HR_CRIT");
+  // Entries older than five minutes fall out of the reference.
+  expect(!rateContextReference(c, 360'001, ref), "readings older than 300 s expire");
+  rateContextNote(c, 130, 360'000);
+  rateContextNote(c, 132, 380'000);
+  rateContextNote(c, 134, 400'000);
+  expect(rateContextReference(c, 400'000, ref) && ref == 132, "only the recent readings count");
 
-  // The bedding readings from 2026-08-26 are corrected by the same rule.
-  expect(effectiveHeartRate(93, 400) == 150, "a fabric reading is corrected, not merely marked");
+  // The ring keeps the newest RATE_CONTEXT_CAP readings and no more.
+  RateContext ring{};
+  for (int i = 0; i < RATE_CONTEXT_CAP + 4; ++i) rateContextNote(ring, 200 + i, 500'000 + i * 1'000);
+  expect(ring.count == RATE_CONTEXT_CAP, "the ring is bounded");
+  expect(rateContextReference(ring, 520'000, ref) && ref == 200 + 4 + (RATE_CONTEXT_CAP - 1) / 2,
+         "the oldest readings are the ones dropped");
+}
 
-  // Outside the plausible interval range the field is garbage and the raw byte survives.
-  expect(effectiveHeartRate(200, 50) == 200, "a 50 ms interval (1200 bpm) is rejected");
-  expect(effectiveHeartRate(200, 149) == 200, "just under 150 ms is rejected");
-  expect(effectiveHeartRate(120, 2001) == 120, "just over 2000 ms is rejected");
-  expect(effectiveHeartRate(200, 0) == 200, "a missing interval cannot correct anything");
-  expect(!readingCorrected(200, 50), "a rejected interval leaves the reading unmarked");
+static void testResolveHeartRate() {
+  // Agreement leaves the byte alone, with or without context.
+  expect(resolveHeartRate(108, 560, true, 110) == 108, "an agreeing reading is the byte");
+  expect(resolveHeartRate(108, 560, false, 0) == 108, "with no context too");
+
+  // 2026-09-19 12:59:42: the byte fell from 171 to 83 while the interval stayed at 352 ms.
+  expect(resolveHeartRate(83, 352, true, 168) == 170, "a halved byte gives way to the interval");
+  // 2026-09-19 06:42:34: the interval doubled to 880 ms while the byte stayed at 126.
+  expect(resolveHeartRate(126, 880, true, 127) == 126, "a doubled interval gives way to the byte");
+  // 2026-09-16 20:07:35: byte 90 against 291 ms (206 bpm) with the last five minutes at 166.
+  expect(resolveHeartRate(90, 291, true, 166) == 206, "the candidate nearer the recent rate wins");
+  // 2026-09-09 13:49:18: byte 117 against 329 ms (182 bpm) with the last five minutes at 125.
+  expect(resolveHeartRate(117, 329, true, 125) == 117, "whichever decode that turns out to be");
+
+  // Without three recent agreeing readings there is nothing to compare against: the byte stands.
+  expect(resolveHeartRate(83, 352, false, 0) == 83, "no context keeps the byte");
+  // A tie goes to the byte, the decode one step closer to the sensor.
+  expect(resolveHeartRate(100, 300, true, 150) == 100, "a tie keeps the byte");
+
+  // Garbage intervals never take over.
+  expect(resolveHeartRate(200, 50, true, 120) == 200, "a 50 ms interval (1200 bpm) is rejected");
+  expect(resolveHeartRate(200, 149, true, 120) == 200, "just under 150 ms is rejected");
+  expect(resolveHeartRate(120, 2001, true, 120) == 120, "just over 2000 ms is rejected");
+  expect(resolveHeartRate(200, 0, true, 120) == 200, "a missing interval cannot correct anything");
+  expect(resolveHeartRate(100, 150, true, 400) == 400, "150 ms is accepted and reads 400 bpm");
+  expect(resolveHeartRate(100, 2000, true, 30) == 30, "2000 ms is accepted and reads 30 bpm");
 
   // A band with no pulse must never be handed a manufactured rate.
-  expect(effectiveHeartRate(0, 375) == 0, "an idle band stays at zero");
-  expect(!readingCorrected(0, 375), "the charging beacon is not corrected");
+  expect(resolveHeartRate(0, 375, true, 160) == 0, "an idle band stays at zero");
 
   // Rounding is to nearest, not toward zero: 60000/271 is 221.4.
-  expect(effectiveHeartRate(110, 271) == (60000 + 271 / 2) / 271, "the correction rounds to nearest");
+  expect(resolveHeartRate(110, 271, true, 220) == 221, "the interval rounds to nearest");
+  expect(intervalHeartRate(271) == 221, "intervalHeartRate rounds the same way");
+  expect(intervalHeartRate(149) == 0 && intervalHeartRate(2001) == 0 && intervalHeartRate(0) == 0,
+         "an unusable interval has no rate");
+}
 
-  // The boundaries themselves are inside the range.
-  expect(effectiveHeartRate(100, 150) == 400, "150 ms is accepted and reads 400 bpm");
-  expect(effectiveHeartRate(100, 2000) == 30, "2000 ms is accepted and reads 30 bpm");
+// The high alarm hears the faster decode whenever the band contradicts itself, so a sudden
+// tachycardia whose byte arrives halved is still counted even while the screen keeps the byte.
+static void testHighAlarmHeartRate() {
+  // Onset: the last five minutes sat at 130, the byte halves to 115, the interval says 270 ms.
+  const int shown = resolveHeartRate(115, 270, true, 130);
+  expect(shown == 115, "continuity keeps the byte at onset");
+  expect(highAlarmHeartRate(115, 270, shown) == 222, "the alarm still hears 222");
+  // A doubled interval never hands the alarm a slower rate than the screen shows.
+  expect(highAlarmHeartRate(126, 880, 126) == 126, "a slow interval is not an alarm input");
+  // Agreement, garbage and silence pass the shown rate through.
+  expect(highAlarmHeartRate(108, 560, 108) == 108, "an agreeing reading is unchanged");
+  expect(highAlarmHeartRate(200, 50, 200) == 200, "a garbage interval is ignored");
+  expect(highAlarmHeartRate(0, 375, 0) == 0, "an idle band stays at zero");
+  // When the screen already shows the interval, the two are the same number.
+  expect(highAlarmHeartRate(83, 352, 170) == 170, "a corrected reading is its own alarm input");
+}
+
+// The scenario the separate alarm input exists for, and the glitch it must shrug off.
+static void testHalvedOnsetStillAlarms() {
+  AlarmConfig cfg{};
+  const int shown = resolveHeartRate(115, 270, true, 130);     // 115 stays on the screen
+  const int heard = highAlarmHeartRate(115, 270, shown);        // 222 reaches the high alarm
+  AlarmMachine high = runWindow(cfg, std::vector<WindowReading>{
+      {heard, true}, {heard, true}, {heard, true}, {heard, true},
+      {heard, true}, {heard, true}, {heard, true}});
+  expect(high.state == AlarmState::ALARM, "a halved onset still confirms");
+  expect(high.cause == AlarmCause::CONFIRMED_HIGH_BEAT, "and is named beat-derived");
+  AlarmMachine low = runWindow(lowConfig(), std::vector<WindowReading>{
+      {shown, false}, {shown, false}, {shown, false}, {shown, false}});
+  expect(low.state == AlarmState::IDLE, "115 on the screen never arms the low alarm");
+
+  // The band's fifteen-minute glitch: one reading of 280 ms (214 bpm) between ordinary ones
+  // arms the window and the next ordinary reading abandons it.
+  AlarmMachine glitch{};
+  alarmOnReading(glitch, cfg, highAlarmHeartRate(110, 545, 110), 0, 1'000'000, false);
+  alarmOnReading(glitch, cfg, highAlarmHeartRate(107, 280, 107), 20'000, 1'000'020, true);
+  expect(glitch.state == AlarmState::ARMED, "one glitch arms the window");
+  alarmOnReading(glitch, cfg, highAlarmHeartRate(112, 540, 112), 40'000, 1'000'040, false);
+  expect(glitch.state == AlarmState::IDLE, "the next ordinary reading abandons it");
 }
 
 // A window holding any beat-derived reading needs three critical readings across 120 s instead of
@@ -1051,7 +1207,7 @@ static void testCorrectedWindow() {
   // The halved reading that used to trip the bradycardia alarm no longer reaches it.
   {
     AlarmConfig low = lowConfig();
-    const int corrected = effectiveHeartRate(80, 375);
+    const int corrected = resolveHeartRate(80, 375, true, 160);
     AlarmMachine m = runWindow(low, std::vector<WindowReading>{
         {corrected, true}, {corrected, true}, {corrected, true}, {corrected, true}});
     expect(m.state == AlarmState::IDLE, "a halved 80 corrected to 160 never arms the low alarm");
@@ -1112,9 +1268,12 @@ int main() {
   testBrightnessRamp();
   testBandDecoder();
   testReadingDisagreement();
-  testEffectiveHeartRate();
+  testRateContext();
+  testResolveHeartRate();
+  testHighAlarmHeartRate();
   testLowAlarm();
   testCorrectedWindow();
+  testHalvedOnsetStillAlarms();
   testVitalsCsv();
   testReadingMerge();
   testRadioHealth();

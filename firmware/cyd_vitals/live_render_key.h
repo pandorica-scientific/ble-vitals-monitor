@@ -30,20 +30,23 @@ struct LiveRenderKey {
   uint8_t alertMask = ALERT_NONE;
   int minuteKey = -1;
   bool corrected = false;         // the rate came from the beat interval
-  bool readingIssue = false;      // the two decodes disagree but the interval is unusable
+  bool readingIssue = false;      // the two decodes disagree and the byte was kept
+  int intervalHeartRate = 0;      // what the interval says, for the note under the number (0: unusable)
 };
 
 inline LiveRenderKey makeLiveRenderKey(const ReadingSnapshot& reading, RadioState radioState,
                                        bool stale, uint8_t alertMask, int minuteKey) {
   const bool corrected = !stale && reading.heartRateCorrected;
-  // A disagreement the interval cannot resolve is still worth saying out loud; it is the bedding
-  // case with a garbage interval, and the number on screen is the doubtful raw byte.
+  // A disagreement where the byte was kept is still said out loud: either the interval had lost
+  // the beat, or it is the bedding case with a garbage interval. Either way the number on screen
+  // is the doubtful raw byte, and the note under it says what the other decode claimed.
   const bool issue = !stale && !corrected &&
                      bandReadingDisagrees(reading.heartRate, reading.beatMs);
   return {stale, reading.sequence, reading.heartRate, reading.effectiveHeartRate,
           reading.oxygenSaturation,
           reading.signal, static_cast<int>(reading.skinC * 10.0f + 0.5f),
-          reading.skinValid, radioState, alertMask, minuteKey, corrected, issue};
+          reading.skinValid, radioState, alertMask, minuteKey, corrected, issue,
+          stale ? 0 : intervalHeartRate(reading.beatMs)};
 }
 
 inline bool operator==(const LiveRenderKey& a, const LiveRenderKey& b) {
@@ -53,7 +56,7 @@ inline bool operator==(const LiveRenderKey& a, const LiveRenderKey& b) {
          a.skinTenths == b.skinTenths && a.skinValid == b.skinValid &&
          a.radioState == b.radioState && a.alertMask == b.alertMask &&
          a.minuteKey == b.minuteKey && a.corrected == b.corrected &&
-         a.readingIssue == b.readingIssue;
+         a.readingIssue == b.readingIssue && a.intervalHeartRate == b.intervalHeartRate;
 }
 
 inline bool operator!=(const LiveRenderKey& a, const LiveRenderKey& b) { return !(a == b); }

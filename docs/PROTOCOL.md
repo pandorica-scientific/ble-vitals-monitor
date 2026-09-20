@@ -177,53 +177,85 @@ This matters more than any labelling question: a band that has come off and is l
 reports a plausible, reassuring heart rate rather than an obvious fault. Silence is a visible
 failure; an invented 93 bpm is not.
 
-**Implemented** in `band_protocol.h` as `bandReadingDisagrees()`. The reading is never dropped, and
-since the half-rate finding below it is no longer merely marked either: when the two decodes
-disagree and the interval is usable, the interval **replaces** the heart-rate byte. See
-`effectiveHeartRate()`. Where the interval is unusable the raw byte stays on screen with
-**"reading issue"** under it, because hiding a doubtful number would trade one silent failure for
-another.
+**Implemented** in `band_protocol.h` as `bandReadingDisagrees()`. The reading is never dropped.
+Which decode is shown when the two disagree is decided by `resolveHeartRate()`, described in the
+next section. Whenever they disagree the raw byte and the interval's rate both stay on screen, as
+**"band X / beat Y"** under the number, or **"reading issue"** when the interval is unusable,
+because hiding a doubtful number would trade one silent failure for another.
 
-### The heart-rate byte also halves  ★CONFIRMED — read this one too
+### Both decodes halve  ★CONFIRMED — read this one too
 
 Bedding is not the only way byte 10 lies. Worn, on a real wrist, it intermittently locks onto every
-second beat and reports half the true rate. Established from 33 days of the board's own logs
-(2026-08-07 to 2026-09-02, ~115,000 readings):
+second beat and reports half the true rate. The first pass over 33 days of raw logs (2026-08-07 to
+2026-09-02, ~115,000 readings) found 70 such episodes, typically ~160 → ~80 bpm for 40 s to 5 min,
+and a highest reading of 191 in the whole period. From 2026-09-02 21:54 the board logged the beat
+interval beside the byte, and 18 days of that (64,633 readings, to 2026-09-20) settle which decode
+to believe when they disagree. The answer is **neither**:
 
 | | |
 |---|---|
-| Episodes where the rate fell to 42–58% of the preceding two minutes and held for ≥2 readings | **70** |
-| Typical episode | ~160 → ~80 bpm, lasting 40 s to 5 min, then back |
-| Highest heart rate in 33 days | **191** |
-| Readings in the 60–99 band | 786 of 114,996 (0.7%), a separate lump centred on 80 |
+| readings where the two decodes disagree by more than 40 bpm | **757** (1.2%) |
+| …with the interval the higher of the two — the byte had halved | 368 |
+| …with the interval the lower of the two — the interval had doubled | 389 |
+| longest run of a doubled interval | 43 readings, 14 min (2026-09-20 06:36: byte 148, interval 73) |
+| a clean run of a halved byte | 17 readings, 6 min (2026-09-19 12:59: byte 83, interval 167) |
 
-Two failures follow from one bug, and they point in opposite directions:
+The interval is not stale when it fails — it keeps changing, at twice the true length — so no
+"stuck value" test catches it. It also throws a single wild reading (280, 305 or 365 ms, i.e.
+214, 197 or 164 bpm) about every fifteen minutes: across 230 single-reading disagreements the most
+common spacing is exactly 15 min, and the SpO2 value changes at the same reading 22% of the time
+against 1.6% at a random reading. That is the band's scheduled SpO2 measurement disturbing its
+beat detector.
 
-- **A real tachycardia arrives halved and invisible.** The high alarm arms at 200 and the byte has
-  never once said more than 191. On 2026-09-02 the board showed a flat 105–120 bpm for an hour,
-  flagged as disagreeing, while the baby was unresponsive in a car seat and a parent counted 3–5
-  beats per second by ear — roughly 180–300 bpm. Doubled, the displayed 110 is 220.
-- **A halved rate arrives as bradycardia.** A real 160 shown as 80 sits exactly on the low alarm's
-  threshold. A hospital Holter over the same period recorded nothing near 80.
+What separates the two decodes in every case is the recent past. The one that has lost the beat
+sits at half or double the rate of the last few minutes; the other is continuous with it. Replaying
+four rules over the 18 days, and scoring a disagreement as right when the chosen number lands
+within 25 bpm of the surrounding agreeing readings:
 
-The beat interval settles both, and it is the same field that caught the bedding readings. When the
-two decodes disagree the interval wins, because it is a measured interval rather than a tracker's
-average. It is only trusted between **150 ms (400 bpm)** and **2000 ms (30 bpm)**: infant SVT
-reaches 250–300 bpm, so the ceiling has to sit well above it, and outside that range the field is
-garbage and the raw byte is kept.
+| rule | right | low-alarm runs | high-alarm runs |
+|---|---|---|---|
+| interval always wins (the firmware of 2026-09-02) | 22% | 37 | 2 |
+| nearer the last shown value | 78% | 23 | 0 |
+| **nearer the median of the last 5 min of agreeing readings** (`band_protocol.h` replayed as the sketch feeds it) | **80%** | **11** | **2** |
+| raw byte, never correct | 70% | 19 | 0 |
 
-> **`effectiveHeartRate(hr, beat_ms)`** = `round(60000 / beat_ms)` when the two disagree by more
-> than 40 bpm and the interval is inside that range; otherwise the raw byte. A zero heart rate
-> stays zero, so an idle band is never handed a manufactured rate.
+A "run" is three or more readings within 120 s at or below 80, or at or above 200: what would reach
+an alarm's confirmation window. The low-alarm runs of the chosen rule are readings the high alarm
+does not see, so they are counted on the shown rate; the high-alarm runs are counted on the high
+alarm's own input, described below. The first rule was worse than doing nothing. It put a false
+60–76 bpm on the screen for 13–14 minutes at a stretch three times in the last two days of that
+period. What defeats the chosen rule is a long messy stretch where both decodes drop beats in turn,
+so that the context itself fills with halved readings: 2026-09-19 18:30–19:20 is the example, and
+most of the residual 20%.
 
-The corrected rate is what the screen, the plots, the logs and **both** alarms use. Because it is
-one step further from the sensor than the byte, a confirmation window containing any corrected
-reading is held to a higher bar: **three critical readings across 120 s** rather than two across
-60 s, and a corrected reading can never fire the implausible-collapse rule. An episode confirmed
-that way is logged and titled `CONFIRMED_HIGH_BEAT`, so it is always clear which decode raised it.
+> **`resolveHeartRate(hr, beat_ms, haveReference, reference)`** — when the two disagree by more
+> than 40 bpm and the interval is inside 150–2000 ms, the candidate nearer `reference` wins, where
+> `reference` is the median of the agreeing readings from the last five minutes (at least three of
+> them, kept in `RateContext`). A tie, or no reference yet, keeps the byte. A zero heart rate stays
+> zero. The decision is made once per measurement, not once per rebroadcast.
+
+The chosen rate is what the screen, the plots, the daily log (`hr_eff`) and the **low** alarm use.
+When the interval is shown the number is orange with "band X / beat Y" under it; when the byte is
+kept despite a disagreement the same note appears under an ordinary number.
+
+**The high alarm hears more.** Continuity has one blind spot: a tachycardia that begins abruptly —
+which is how supraventricular tachycardia begins — while the byte halves at the same moment. The
+halved byte is then the candidate nearer the recent past, and the screen keeps it. So the high
+alarm is fed the faster decode whenever the band contradicts itself (`highAlarmHeartRate()`),
+flagged as corrected so that the longer confirmation window applies: **three critical readings
+across 120 s** rather than two across 60 s, and never the implausible-collapse rule. The
+fifteen-minute glitch arms a window that the next ordinary reading abandons. Over the 18 days this
+input would have confirmed twice: 2026-09-16 20:07 (byte 78–95 against 205–250 bpm on the
+interval for a minute, the previous five minutes at 166 — plausibly real) and 2026-09-09 13:50
+(byte 85–96 against 204–250 for two minutes, the previous five minutes at 125 and the next at 150
+— doubtful). That is the accepted price of not missing a halved onset. An episode confirmed that
+way is logged and titled
+`CONFIRMED_HIGH_BEAT`, so it is always clear which decode raised it. The low alarm never hears the
+interval: a doubled interval must not pose as bradycardia.
 
 The daily CSV carries `beat_ms` and `hr_eff` alongside the raw `hr_bpm` for exactly this reason:
-the correction has to remain auditable after the fact.
+the decision has to remain auditable after the fact. Rows written by the 2026-09-02 firmware carry
+the `hr_eff` of the interval-always-wins rule, false lows included.
 
 Two smaller edges from the same run:
 

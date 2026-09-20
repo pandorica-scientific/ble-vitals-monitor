@@ -11,8 +11,8 @@
 // refill its charts, and a column read one place to the left is a silently wrong graph.
 //
 // hr_bpm stays the band's raw byte and hr_eff carries the rate everything actually uses (see
-// effectiveHeartRate() in band_protocol.h). Keeping both is the point: the raw column is what the
-// report page already reads and what a later analysis needs to check the correction against, and
+// resolveHeartRate() in band_protocol.h). Keeping both is the point: the report page plots hr_eff
+// where a row has one, a later analysis needs the raw column to check the decision against, and
 // beat_ms is the evidence for why a reading was corrected at all.
 constexpr char VITALS_CSV_HEADER[] = "timestamp,hr_bpm,spo2_pct,skin_c,beat_ms,hr_eff";
 

@@ -23,9 +23,10 @@
 //     such reading; against a wristband that manufactures numbers off bedding it is far more
 //     likely to be an artifact, and alarming on it would wake the house for nothing.
 //
-// A reading can arrive CORRECTED: the band's heart-rate byte locks onto every second beat, so the
-// rate that reaches this machine is sometimes derived from the beat interval instead (see
-// effectiveHeartRate() in band_protocol.h). That number is trustworthy enough to alarm on - it is
+// A reading can arrive CORRECTED: both of the band's decodes lock onto every second beat now and
+// then, so the rate that reaches this machine is sometimes the beat interval's rather than the
+// byte's (see resolveHeartRate() and highAlarmHeartRate() in band_protocol.h). It is enough to
+// alarm on - it is
 // the only way this receiver can see a rate above 191 at all - but it is one step further from the
 // sensor than the byte, so a window containing any corrected reading is held to a higher bar:
 // three critical readings across 120 s rather than two across 60 s. Same thresholds, same latch,

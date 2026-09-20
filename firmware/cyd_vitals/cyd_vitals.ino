@@ -148,6 +148,7 @@ SPIClass sdSPI(VSPI);
 
 // ---------- shared vitals ----------
 ReadingSnapshot g_reading;
+RateContext g_rateContext;   // the last five minutes of agreeing readings, see band_protocol.h
 portMUX_TYPE g_readingMux = portMUX_INITIALIZER_UNLOCKED;
 
 ReadingSnapshot readSnapshot() {
@@ -159,7 +160,7 @@ ReadingSnapshot readSnapshot() {
 
 void publishReading(const BandReading& frame, int rssi, uint32_t nowMs) {
   portENTER_CRITICAL(&g_readingMux);
-  g_reading = mergeBandReading(g_reading, frame, rssi, nowMs);
+  g_reading = mergeBandReading(g_reading, frame, rssi, nowMs, g_rateContext);
   portEXIT_CRITICAL(&g_readingMux);
 }
 
@@ -729,19 +730,20 @@ void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,ui
   // top row: big current values
   if(full || key.effectiveHeartRate!=prev.effectiveHeartRate || key.heartRate!=prev.heartRate ||
      key.stale!=prev.stale || key.corrected!=prev.corrected ||
-     key.readingIssue!=prev.readingIssue){
+     key.readingIssue!=prev.readingIssue || key.intervalHeartRate!=prev.intervalHeartRate){
     // Orange for a corrected number, so a rate that came from the beat interval never looks like
     // an ordinary reading, whether or not it happens to sit inside the safe band.
     const uint16_t hrColour = d ? DIM
                                 : (key.corrected ? TFT_ORANGE
                                    : ((shownHr&&(shownHr<HR_LOW||shownHr>HR_HIGH))?TFT_RED:0x6E6C));
     cell(0,0,"HEART",heartText,"bpm",hrColour);
-    // Under the value: what the band said against what its own beat timing said. The band's byte
-    // locks onto every second beat, so the number above is often the only true one - but hiding
-    // the disagreement would hide the reason to believe it.
+    // Under the value: what the band said against what its own beat timing said. Either decode
+    // can lock onto every second beat, so whichever one is shown above, the other is worth seeing
+    // - and "reading issue" is reserved for an interval too wild to state as a rate.
     if(key.corrected || key.readingIssue){
       char note[24];
-      if(key.corrected) snprintf(note,sizeof(note),"band %d / beat %d",reading.heartRate,shownHr);
+      if(key.intervalHeartRate>0)
+        snprintf(note,sizeof(note),"band %d / beat %d",reading.heartRate,key.intervalHeartRate);
       else strlcpy(note,"reading issue",sizeof(note));
       tft.setFont(&fonts::Font0); tft.setTextSize(1);
       tft.setTextColor(d?DIM:TFT_ORANGE);
@@ -1021,16 +1023,19 @@ void onAlarmStarted(const ReadingSnapshot& r){
   view=ALARM; setBacklight(255); g_renderKeyValid=false; g_alarmKeyValid=false;
   const AlarmMachine* m=firingAlarm();
   const AlarmCause cause = m ? m->cause : AlarmCause::NONE;
+  // The rate the firing machine acted on: the high alarm may have heard the beat interval while
+  // the screen kept the byte, and the log has to say which number raised it.
+  const int acted = (m==&g_alarm) ? r.highAlarmHeartRate : r.effectiveHeartRate;
   // The cause name stays the first token of the detail column: reconcileAlertLine() matches on it.
   char detail[48];
-  if(r.heartRateCorrected)
+  if(acted!=r.heartRate)
     snprintf(detail,sizeof(detail),"%s band=%d beat=%dms",alarmCauseName(cause),
              r.heartRate,r.beatMs);
   else
     snprintf(detail,sizeof(detail),"%s",alarmCauseName(cause));
-  logAlert("ONSET",r.effectiveHeartRate,r.oxygenSaturation,detail);
+  logAlert("ONSET",acted,r.oxygenSaturation,detail);
   Serial.printf("[alarm] %s hr=%d band=%d beat=%d\n",alarmCauseName(cause),
-                r.effectiveHeartRate,r.heartRate,r.beatMs);
+                acted,r.heartRate,r.beatMs);
 }
 
 void leaveAlarmView(){
@@ -1064,8 +1069,11 @@ void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool 
   AlarmMachine* firing=firingAlarm();
   a.machine = firing ? firing : &g_alarm;    // self-test borrows the high machine's empty state
   a.contacts=&g_contacts;
-  a.heartRate=reading.effectiveHeartRate; a.rawHeartRate=reading.heartRate;
-  a.corrected=reading.heartRateCorrected; a.oxygen=reading.oxygenSaturation;
+  // The number on the alarm screen is the one the firing machine acted on, which for the high
+  // alarm can be the beat interval's rate while the live view kept the byte.
+  a.heartRate = (firing==&g_alarm) ? reading.highAlarmHeartRate : reading.effectiveHeartRate;
+  a.rawHeartRate=reading.heartRate;
+  a.corrected = a.heartRate!=reading.heartRate; a.oxygen=reading.oxygenSaturation;
   a.oxygenAgeMin = (g_spo2StampEpoch && nowE>=g_spo2StampEpoch)
                      ? static_cast<int>((nowE-g_spo2StampEpoch)/60) : -1;
   a.elapsedS = g_selfTest ? 0 : alarmElapsedS(*a.machine,nowE);
@@ -1077,7 +1085,7 @@ void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool 
   // a redraw: the vitals and trace only when a new reading lands (~20 s), the timer once a
   // second in its own corner, the frame twice a second as six thin rectangles.
   const int key = reading.sequence*7 + reading.effectiveHeartRate + reading.heartRate*11
-                  + reading.oxygenSaturation*3
+                  + reading.highAlarmHeartRate*13 + reading.oxygenSaturation*3
                   + (stale?9001:0) + static_cast<int>(radioState)*37;
   if(!g_alarmKeyValid || key!=g_alarmKey){
     g_alarmKey=key; g_alarmKeyValid=true;
@@ -1180,15 +1188,19 @@ void loop(){
       lastAlarmSeq=reading.sequence;
       const uint32_t nowE=nowEpochOrZero();      // one clock read per reading, not three
       if(reading.oxygenSaturation>0) g_spo2StampEpoch=nowE;
-      // Both machines see the corrected rate. That is the whole point: a halved 160 arriving as
-      // 80 must not raise a bradycardia alarm, and a true 220 arriving as 110 must still raise a
-      // tachycardia one.
-      AlarmEvent ev=alarmOnReading(g_alarm,ALARM_CFG,reading.effectiveHeartRate,millis(),nowE,
-                                   reading.heartRateCorrected);
+      // The low alarm hears the displayed rate and the high alarm hears the faster decode
+      // whenever the band contradicts itself (highAlarmHeartRate() in band_protocol.h). A
+      // doubled interval must never pose as bradycardia, and a tachycardia whose byte arrives
+      // halved must still be counted even while the screen keeps the byte.
+      const bool highCorrected = reading.highAlarmHeartRate!=reading.heartRate;
+      AlarmEvent ev=alarmOnReading(g_alarm,ALARM_CFG,reading.highAlarmHeartRate,millis(),nowE,
+                                   highCorrected);
       AlarmEvent evLow=alarmOnReading(g_alarmLow,ALARM_LOW_CFG,reading.effectiveHeartRate,
                                       millis(),nowE,reading.heartRateCorrected);
       if(ev.alarmStarted||evLow.alarmStarted) onAlarmStarted(reading);
-      if(ev.episodeResolved||evLow.episodeResolved)
+      if(ev.episodeResolved)
+        logAlert("RESOLVED",reading.highAlarmHeartRate,reading.oxygenSaturation,"");
+      if(evLow.episodeResolved)
         logAlert("RESOLVED",reading.effectiveHeartRate,reading.oxygenSaturation,"");
     }
     AlarmEvent tick=alarmTick(g_alarm,ALARM_CFG,millis(),stale);
