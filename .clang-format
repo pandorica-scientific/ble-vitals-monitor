@@ -1,0 +1,16 @@
+# Formatting for the C++ headers, the sketches and the native tests.
+# Run: clang-format -i firmware/**/*.h firmware/**/*.ino tests/*.cpp
+BasedOnStyle: Google
+ColumnLimit: 100
+IndentWidth: 2
+DerivePointerAlignment: false
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+AlignConsecutiveAssignments: false
+AlignTrailingComments: true
+SpacesBeforeTrailingComments: 3
+IncludeBlocks: Preserve
+SortIncludes: true

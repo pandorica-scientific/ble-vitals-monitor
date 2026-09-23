@@ -1,22 +1,27 @@
-// provision_wifi.ino — interactively write one Wi-Fi credential slot to the CYD SD card.
+// provision_wifi.ino - writes one WiFi credential slot, the emergency contacts, or the over-the-air
+// update password to the CYD's SD card over a serial prompt, so the card never has to leave the
+// board.
 //
 // Credentials arrive over the serial connection at runtime. They are never compiled into this
-// sketch and are never echoed by the firmware. Select "primary" for /wifi.txt, "backup" for
-// /wifi_backup.txt, or "backup2" for /wifi_backup2.txt. The selected file is written through a
-// verified temporary file, with the old target retained until the replacement has also been
-// verified.
+// sketch and are never echoed back. The slot ("primary", "backup" or "backup2") is written through
+// a verified temporary file, with the old target kept until the replacement has also been verified,
+// so an interrupted write cannot leave the card without a usable file.
+//
+// Build: arduino-cli compile -b esp32:esp32:esp32 firmware/provision_wifi
+// Flash: arduino-cli upload  -b esp32:esp32:esp32 -p /dev/cu.usbserial-XXXX firmware/provision_wifi
+// Then:  arduino-cli monitor -p /dev/cu.usbserial-XXXX -c baudrate=115200 and follow the prompts.
 
-#include <SPI.h>
 #include <SD.h>
+#include <SPI.h>
 #include <WiFi.h>
 
-#include "../cyd_vitals/wifi_failover.h"
+#include "../cyd_vitals/config.h"
 #include "../cyd_vitals/contacts.h"
+#include "../cyd_vitals/ota_password.h"
+#include "../cyd_vitals/wifi_failover.h"
 
-#define SD_SCK 18
-#define SD_MISO 19
-#define SD_MOSI 23
-#define SD_CS 5
+constexpr char CONTACTS_PATH[] = "/contacts.txt";
+constexpr uint32_t NETWORK_TEST_TIMEOUT_MS = 15'000;
 
 SPIClass sdSPI(VSPI);
 
@@ -123,21 +128,20 @@ bool writeCredentialTransactional(const char* target, const char* temp,
   return true;
 }
 
-// /contacts.txt holds the emergency numbers shown on the alarm screen. Like the credentials
-// above, they arrive over the serial connection at runtime and are never compiled into this
-// sketch: the repository is published for other people to build, and one family's hospital
-// numbers must never end up on a stranger's screen.
+// /contacts.txt holds the emergency numbers shown on the alarm screen. Like the credentials, they
+// arrive over the serial connection and are never compiled in: one family's hospital numbers must
+// never end up on a stranger's screen.
 bool writeContacts(const String& first, const String& second) {
-  File file = SD.open("/contacts.txt", FILE_WRITE);
+  File file = SD.open(CONTACTS_PATH, FILE_WRITE);
   if (!file) return false;
   file.println(first);
   if (second.length() > 0) file.println(second);
   file.flush();
   file.close();
 
-  // Read it back through the same parser the monitor uses, so "stored" means the monitor will
-  // actually show these lines rather than merely that bytes reached the card.
-  File check = SD.open("/contacts.txt", FILE_READ);
+  // Read back through the same parser the monitor uses, so "stored" means the monitor will show
+  // these lines rather than merely that bytes reached the card.
+  File check = SD.open(CONTACTS_PATH, FILE_READ);
   if (!check) return false;
   char buf[128];
   size_t n = check.readBytes(buf, sizeof(buf) - 1);
@@ -154,12 +158,36 @@ bool writeContacts(const String& first, const String& second) {
   return true;
 }
 
+// /ota.txt holds the password the monitor demands before accepting a firmware upload in its
+// maintenance mode. Read back through the monitor's own parser, so "stored" means the monitor will
+// accept it.
+bool writeOtaPassword(const String& password) {
+  File file = SD.open(OTA_PASSWORD_PATH, FILE_WRITE);
+  if (!file) return false;
+  file.println(password);
+  file.flush();
+  file.close();
+
+  File check = SD.open(OTA_PASSWORD_PATH, FILE_READ);
+  if (!check) return false;
+  char buf[128];
+  const size_t n = check.readBytes(buf, sizeof(buf) - 1);
+  buf[n] = '\0';
+  check.close();
+
+  char parsed[OTA_PASSWORD_MAX];
+  const bool ok = parseOtaPassword(buf, parsed, sizeof(parsed)) && password == String(parsed);
+  memset(buf, 0, sizeof(buf));
+  memset(parsed, 0, sizeof(parsed));
+  return ok;
+}
+
 bool testSelectedNetwork(const String& ssid, const String& password) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), password.c_str());
   uint32_t startedMs = millis();
   while (WiFi.status() != WL_CONNECTED &&
-         static_cast<uint32_t>(millis() - startedMs) < 15000) {
+         static_cast<uint32_t>(millis() - startedMs) < NETWORK_TEST_TIMEOUT_MS) {
     delay(250);
   }
   bool connected = WiFi.status() == WL_CONNECTED;
@@ -175,11 +203,11 @@ void setup() {
   delay(500);
   Serial.println("\n=== CYD SD card provisioner ===");
 
-  String slotLabel = readLine("slot (primary, backup, backup2, or contacts), then Enter:");
+  String slotLabel = readLine("slot (primary, backup, backup2, contacts, or ota), then Enter:");
 
-  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, sdSPI) || SD.cardType() == CARD_NONE) {
-    Serial.println("[SD] init FAILED");
+  sdSPI.begin(SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS);
+  if (!SD.begin(SD_PIN_CS, sdSPI) || SD.cardType() == CARD_NONE) {
+    Serial.println("[sd] init FAILED");
     return;
   }
 
@@ -194,6 +222,21 @@ void setup() {
     }
     bool stored = writeContacts(first, second);
     Serial.printf("[sd] contacts stored=%s\n", stored ? "yes" : "no");
+    return;
+  }
+
+  if (slotLabel == "ota") {
+    Serial.printf("over-the-air update password: one line, at least %u characters\n",
+                  static_cast<unsigned>(OTA_PASSWORD_MIN));
+    String password = readLine("password, then Enter:");
+    if (password.length() < OTA_PASSWORD_MIN) {
+      Serial.println("too short");
+      password = "";
+      return;
+    }
+    bool stored = writeOtaPassword(password);
+    password = "";
+    Serial.printf("[sd] ota password stored=%s\n", stored ? "yes" : "no");
     return;
   }
 

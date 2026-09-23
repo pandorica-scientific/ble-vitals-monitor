@@ -1,72 +1,71 @@
-// reader_serial.ino — standalone Baby Sensor Relax reader on the ESP32 (serial only, no display).
-// RECEIVE-ONLY: passive BLE scan; never connects/writes/pairs. Cannot affect the base link.
-// Decodes the wristband's 23-byte advertisement and prints vitals over serial.
+// reader_serial.ino - Baby Sensor Relax reader for a bare ESP32: decoded vitals over serial, no
+// display, no SD card.
 //
-// Frame (device type 0x03 = wristband):
-//   b0 F5 marker | b1 03 type | b2 counter | b4 signal | b7 body-raw | b9 skin-raw
-//   b10 HR bpm | b13 SpO2 % | b16-21 MAC(LE) | b22 checksum
-//   skin_C = b9/2 + 0.5   body_C = b7/2 + 0.5   (blank if implausible)
+// Receive-only: a passive BLE scan that never connects, pairs or transmits, so it cannot affect the
+// wristband's link to its base. Decoding is shared with the main firmware through band_protocol.h,
+// so this sketch cannot drift from it.
 //
-// NOTE: thresholds below are ARBITRARY and NOT medical advice. This is a hobby reader,
-// not a safety device. Keep using the official monitor.
+// Thresholds below are arbitrary and not medical advice. Hobby reader, not a safety device.
+//
+// Build: arduino-cli compile -b esp32:esp32:esp32 firmware/reader_serial
+// Flash: arduino-cli upload  -b esp32:esp32:esp32 -p /dev/cu.usbserial-XXXX firmware/reader_serial
+// View:  arduino-cli monitor -p /dev/cu.usbserial-XXXX -c baudrate=115200
 
+#include <BLEAdvertisedDevice.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
 
-// --- configurable alert thresholds (informational only) ---
-#define HR_LOW   90
-#define HR_HIGH  180
-#define SPO2_LOW 90
-#define SKIN_MIN 28.0   // plausibility gate
-#define SKIN_MAX 42.0
+#include "../cyd_vitals/band_protocol.h"
 
-static int lastSeq = -1;
+// Informational only: they colour nothing and alarm nothing, they just tag the line.
+constexpr int HR_LOW = 90;
+constexpr int HR_HIGH = 180;
+constexpr int SPO2_LOW = 90;
 
-class CB : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice dev) override {
-    if (!dev.haveManufacturerData()) return;
-    String m = dev.getManufacturerData();
-    if (m.length() < 23) return;
-    const uint8_t* b = (const uint8_t*)m.c_str();
-    if (b[0] != 0xF5 || b[1] != 0x03) return;      // wristband frames only
+static int g_lastSequence = -1;
 
-    int seq = b[2];
-    if (seq == lastSeq) return;                     // one line per new reading
-    lastSeq = seq;
+class BandScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice device) override {
+    if (!device.haveManufacturerData()) return;
+    const String manufacturer = device.getManufacturerData();
+    BandReading reading{};
+    if (!decodeBandFrame(reinterpret_cast<const uint8_t*>(manufacturer.c_str()),
+                         manufacturer.length(), reading)) {
+      return;
+    }
+    if (reading.sequence == g_lastSequence) return;   // one line per new measurement
+    g_lastSequence = reading.sequence;
 
-    int hr = b[10], spo2 = b[13], sig = b[4];
-    float skin = b[9] / 2.0f + 0.5f;
-    float body = b[7] / 2.0f + 0.5f;
-    bool tempOK = (skin >= SKIN_MIN && skin <= SKIN_MAX);
+    char skin[8];
+    if (reading.skinValid) {
+      snprintf(skin, sizeof(skin), "%.1fC", static_cast<double>(reading.skinC));
+    } else {
+      snprintf(skin, sizeof(skin), "--");
+    }
 
-    char skinS[8], bodyS[8];
-    if (tempOK) { snprintf(skinS, 8, "%.1fC", skin); snprintf(bodyS, 8, "%.1fC", body); }
-    else        { strcpy(skinS, "  --"); strcpy(bodyS, "  --"); }
+    String flags;
+    if (reading.heartRate < HR_LOW) flags += " HR-LOW";
+    if (reading.heartRate > HR_HIGH) flags += " HR-HIGH";
+    if (reading.oxygenSaturation < SPO2_LOW) flags += " SpO2-LOW";
+    if (bandReadingDisagrees(reading.heartRate, reading.beatMs)) flags += " HR-DISAGREE";
 
-    // alert flags (informational)
-    String flag = "";
-    if (hr < HR_LOW)  flag += " HR-LOW";
-    if (hr > HR_HIGH) flag += " HR-HIGH";
-    if (spo2 < SPO2_LOW) flag += " SpO2-LOW";
-
-    Serial.printf("HR %3d bpm | SpO2 %3d%% | skin %-6s | body %-6s | sig %2d | rssi %d%s\n",
-                  hr, spo2, skinS, bodyS, sig, dev.getRSSI(),
-                  flag.length() ? ("  <<<ALERT:" + flag).c_str() : "");
+    Serial.printf("HR %3d bpm | beat %4d ms | SpO2 %3d%% | skin %-6s | sig %2d | rssi %d%s%s\n",
+                  reading.heartRate, reading.beatMs, reading.oxygenSaturation, skin,
+                  reading.signal, device.getRSSI(), flags.length() ? "  <<<" : "", flags.c_str());
   }
 };
 
 void setup() {
   Serial.begin(115200);
   delay(400);
-  Serial.println("\n=== Baby Sensor Relax — ESP32 reader (RECEIVE-ONLY) ===");
-  Serial.println("thresholds are informational only, NOT medical. one line per new reading.\n");
+  Serial.println("\n=== Baby Sensor Relax - ESP32 serial reader (receive-only) ===");
+  Serial.println("flags are informational only, not medical. one line per new measurement.\n");
   BLEDevice::init("");
   BLEScan* scan = BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(new CB(), true);
-  scan->setActiveScan(true);
+  scan->setAdvertisedDeviceCallbacks(new BandScanCallbacks(), true);
+  scan->setActiveScan(false);   // passive: never transmit a scan request
   scan->setInterval(100);
-  scan->setWindow(99);
+  scan->setWindow(100);
   scan->start(0, nullptr, false);
 }
 

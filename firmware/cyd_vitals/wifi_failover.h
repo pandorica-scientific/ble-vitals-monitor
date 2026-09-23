@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <string.h>
 
+// The three WiFi credential slots on the SD card and the order they are tried in. Pure logic; the
+// sketch supplies the function that actually connects. Slot labels are safe to log, paths are not
+// secret, contents are.
+
 enum class WifiSlot : uint8_t { PRIMARY, BACKUP, BACKUP2 };
 
 inline const char* wifiCredentialPath(WifiSlot slot) {
@@ -14,6 +18,7 @@ inline const char* wifiCredentialPath(WifiSlot slot) {
   return "";
 }
 
+// Written first by the provisioner, then renamed over the target once verified.
 inline const char* wifiCredentialTempPath(WifiSlot slot) {
   switch (slot) {
     case WifiSlot::PRIMARY: return "/wifi.tmp";
@@ -23,6 +28,7 @@ inline const char* wifiCredentialTempPath(WifiSlot slot) {
   return "";
 }
 
+// Holds the previous target until the replacement has been verified in place.
 inline const char* wifiCredentialRollbackPath(WifiSlot slot) {
   switch (slot) {
     case WifiSlot::PRIMARY: return "/wifi.bak";
@@ -55,6 +61,7 @@ inline bool parseWifiSlot(const char* label, WifiSlot& out) {
   return true;
 }
 
+// Tries the slots in order and stops at the first success.
 template <typename TrySlot>
 bool runWifiFailover(TrySlot trySlot) {
   if (trySlot(WifiSlot::PRIMARY)) return true;

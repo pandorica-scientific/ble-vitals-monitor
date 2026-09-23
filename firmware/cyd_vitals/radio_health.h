@@ -2,6 +2,15 @@
 
 #include <stdint.h>
 
+// Classifies what the receiver can actually distinguish about its own Bluetooth reception, from
+// timestamps alone. Pure logic.
+//
+//   STARTING        the scan was started less than RADIO_START_GRACE_MS ago and nothing yet
+//   RECEIVING       wristband frames are arriving
+//   BAND_MISSING    other Bluetooth traffic is arriving, but the wristband is not (out of range,
+//                   or on the charger)
+//   SCANNER_SILENT  no traffic at all: the scanner itself has stalled and is restarted, rate-limited
+
 constexpr uint32_t RADIO_START_GRACE_MS = 30'000;
 constexpr uint32_t RADIO_TRAFFIC_STALE_MS = 30'000;
 constexpr uint32_t RADIO_RESTART_COOLDOWN_MS = 60'000;
@@ -36,7 +45,18 @@ inline RadioState classifyRadioHealth(const RadioHealthInput& input) {
   return RadioState::SCANNER_SILENT;
 }
 
-inline bool shouldRestartScan(RadioState state, bool attempted, uint32_t nowMs, uint32_t lastAttemptMs) {
+inline bool shouldRestartScan(RadioState state, bool attempted, uint32_t nowMs,
+                              uint32_t lastAttemptMs) {
   if (state != RadioState::SCANNER_SILENT) return false;
   return !attempted || static_cast<uint32_t>(nowMs - lastAttemptMs) >= RADIO_RESTART_COOLDOWN_MS;
+}
+
+inline const char* radioStateName(RadioState state) {
+  switch (state) {
+    case RadioState::STARTING: return "STARTING";
+    case RadioState::RECEIVING: return "RECEIVING";
+    case RadioState::BAND_MISSING: return "BAND_MISSING";
+    case RadioState::SCANNER_SILENT: return "SCANNER_SILENT";
+  }
+  return "UNKNOWN";
 }

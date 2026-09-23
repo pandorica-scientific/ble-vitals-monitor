@@ -1,178 +1,76 @@
-// cyd_vitals.ino — Baby Sensor Relax monitor + logger (CYD ESP32-2432S028).
-// RECEIVE-ONLY passive BLE. Never connects/writes/pairs -> base link untouched.
+// cyd_vitals.ino - Baby Sensor Relax passive monitor and logger for the CYD ESP32-2432S028.
 //
-// Display: big HR + SpO2, skin temp small by the name, 1-hour BPM/SpO2 sparklines with
-//   yellow/red warning lines. Tap a column -> 24h avg±std chart (tap cycles 1h/30m/15m;
-//   auto-returns to live after 10 s of no touch).
-// Also: WiFi+NTP clock (Europe/Warsaw) synced once at boot then reboots BLE-only (coexistence),
-//   per-reading CSV logging to microSD (one file per day), and a backlight that fades to about a
-//   tenth of full over an hour from sunset so it doesn't light up the room at night (day_night.h).
-// Power: use a stable regulated 5 V supply. Both the radio and the backlight now run continuously
-//   at full by day, which is deliberate - see the powerbank note at SCAN_INTERVAL_MS.
-// Export: swipe UP on the live view and the board becomes its own WiFi access point serving the
-//   logged CSVs to a phone, so a week or a month can be pulled anywhere without removing the SD
-//   card. Swipe DOWN (or wait out the timeout) to resume. Monitoring is PAUSED while it is up.
+// Receive-only: the board listens to the advertisements the wristband already broadcasts. It never
+// connects, pairs or transmits to the wristband or its base, so the official system is untouched.
 //
-// Panel: TPM408 = ILI9342 320x240. Touch: XPT2046 bit-banged (own pins, no SD SPI clash).
-// Decode: HR = byte10, SpO2 = byte13, SKIN C = big-endian uint16(bytes 6-7)/10.
-// Thresholds are ARBITRARY, NOT medical advice. Hobby device, not a safety monitor.
+// This file is the glue. Pure logic lives in the natively tested headers, drawing in the *_render.h
+// headers, every tunable in config.h. Sections, in order:
+//
+//   readings   the latest decoded frame, shared between the BLE task and the loop
+//   radio      passive BLE scan, its health classification and rate-limited recovery
+//   clock      local time helpers; WiFi + NTP once per power cycle, then a soft reboot to BLE-only
+//   storage    daily CSV, /alerts.csv, /boot.log and /contacts.txt on the microSD card
+//   backlight  solar day/night schedule and the dark theme
+//   touch      XPT2046 sampling (gestures are decoded by gesture.h and hold_gesture.h)
+//   export     swipe up: the board becomes an access point serving the CSVs; monitoring pauses
+//   update     swipe down: the board joins the home network and accepts a firmware upload
+//   views      live, 24-hour plot, alarm screen and the alarm self-test
+//   alarms     feeding both critical alarm machines
+//   setup, loop
+//
+// Thresholds are arbitrary and not medical advice. Hobby device, not a safety monitor.
 
 #define LGFX_USE_V1
-#include <LovyanGFX.hpp>
+#include <ArduinoOTA.h>
+#include <BLEAdvertisedDevice.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
-#include <SPI.h>
+#include <LovyanGFX.hpp>
 #include <SD.h>
-#include <WiFi.h>
-#include <esp_wifi.h>
-#include <esp_system.h>    // esp_reset_reason() - see logBoot()
+#include <SPI.h>
 #include <WebServer.h>
+#include <WiFi.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
 #include <time.h>
-#include <math.h>
-#include "band_protocol.h"
-#include "live_render_key.h"
-#include "radio_health.h"
-#include "wifi_failover.h"
-#include "critical_alarm.h"
-#include "trace_window.h"
-#include "hold_gesture.h"
+
+#include "alarm_render.h"
 #include "alert_log.h"
-#include "vitals_csv.h"
+#include "app_html.h"
+#include "band_protocol.h"
+#include "config.h"
 #include "contacts.h"
-#include "day_night.h"     // solar dimming schedule and the backlight ramp
-#include "app_html.h"      // the report page served in export mode (PROGMEM)
+#include "critical_alarm.h"
+#include "day_bins.h"
+#include "day_night.h"
+#include "display.h"
+#include "export_render.h"
+#include "firmware_health.h"
+#include "gesture.h"
+#include "history.h"
+#include "hold_gesture.h"
+#include "live_render.h"
+#include "live_render_key.h"
+#include "maintenance_render.h"
+#include "ota_password.h"
+#include "plot_render.h"
+#include "radio_health.h"
+#include "trace_window.h"
+#include "vitals_csv.h"
+#include "wifi_failover.h"
 
-#define ROTATION 0
-#define HR_LOW 90
-#define HR_HIGH 180
-#define SPO2_LOW 90
-#define STALE_MS 30000
-// ---- critical tachycardia alarm ----
-// Sized against a ten-minute decision window: a sustained rate at or above HR_CRIT means a
-// hospital visit within roughly ten minutes, so a one-minute confirmation costs 10% of it.
-// HR_CANCEL deliberately equals HR_HIGH so the three levels read as one coherent scale.
-#define HR_CRIT             200   // bpm at or above which the alarm arms
-#define HR_SUSTAIN          190   // the last reading of the window must be at or above this
-#define HR_CANCEL           180   // a reading below this abandons the window
-#define HR_COLLAPSE_FROM    170   // previous reading at or above this...
-#define HR_COLLAPSE_TO       60   // ...and this one at or below it escalates at once
-#define HR_RAIL             255   // the uint8_t ceiling; shown as ">=255"
-// ---- critical bradycardia alarm ----
-// The same machine and the same window, thresholds read the other way up. The scale mirrors the
-// tachycardia one - 10 bpm of slack to confirm, 20 to abandon - and HR_SUSTAIN_LOW deliberately
-// equals HR_LOW, exactly as HR_CANCEL equals HR_HIGH, so all six numbers read as one design.
-#define HR_CRIT_LOW          80   // bpm at or below which the alarm arms
-#define HR_SUSTAIN_LOW       90   // the last reading of the window must be at or below this
-#define HR_CANCEL_LOW       100   // a reading above this abandons the window
-#define CRIT_MIN_HIGH         2   // readings at or above HR_CRIT needed in one window
-#define CRIT_MIN_CORRECTED    3   // ...and when the window rests on beat-interval readings
-#define CRIT_CONFIRM_CORRECTED_MS 120000
-#define CRIT_CONFIRM_MS   60000   // confirmation window length
-#define ALARM_SNOOZE_MS  600000   // suppression after a dismissal, so the board can be carried
-#define ALARM_FLASH_MS      500   // half-period of the perimeter flash
-#define HOLD_COUNTDOWN_MS  3000   // hold duration for dismissal and self-test alike
-// 60 s, not 10: the heart rate updates roughly every 20 seconds, so a ten-second test never shows
-// the trace move and cannot demonstrate that it is live. A minute spans about three readings.
-// A three-second hold ends it early, so it never traps the screen.
-#define SELFTEST_DURATION_S  60   // how long the test alarm runs before returning by itself
-#define SPO2_STALE_MIN       20   // minutes after which the oxygen reading is greyed
-// backlight: dim overnight so the display doesn't light up the room. The schedule follows sunset
-// and sunrise for this location rather than two fixed times, and both edges fade over an hour
-// instead of stepping; the levels, clamps and solar maths all live in day_night.h.
-#define FORCE_NIGHT 0             // test aid: set to 1 to force night mode regardless of the clock,
-                                  // so the dark theme can be checked without waiting for sunset
-// BLE scan duty cycle. Receiving costs ~90-100 mA.
-// MEASURED on this board with the display and SD logging running - reception falls off much faster
-// than the duty ratio suggests, because rendering and SD writes compete with the radio:
-//   300/1000 (30%) -> worst gap 13.0 s, ~15 adverts/30 s  - too close to STALE_MS, drops to "--"
-//   500/1000 (50%) -> worst gap  2.0 s, ~29 adverts/30 s  - previous setting
-//   100/100 (100%) -> continuous; the radio never sleeps
-//
-// Why 100% rather than the cheaper 50%: this runs from a powerbank, and many powerbanks switch
-// themselves off when the load drops below a minimum threshold. A continuously-on receiver keeps
-// the draw above that floor. Mains power was never the constraint; unplanned shutdown was.
-//
-// What it does NOT buy is more data, and no future change should assume otherwise. A Mac capture
-// scanning continuously (the 100%-duty case) measured a median inter-frame gap of 1.52 s - the
-// band's own advertising period - and every frame between measurement-counter bumps carries a
-// byte-for-byte identical payload. The ceiling is one new measurement per ~14-20 s no matter how
-// hard we listen; see docs/PROTOCOL.md. This setting buys frame-loss margin, not resolution.
-#define SCAN_INTERVAL_MS 100      // how often a scan window starts
-#define SCAN_WINDOW_MS   100      // equal to the interval: continuous scan, no gap between windows
-// ---- data export mode: swipe UP from the live view, swipe DOWN to resume ----
-// The board becomes its own WiFi access point and serves the logged CSVs to a phone, so the data
-// can be pulled anywhere (a doctor's office) with no home network, no hotspot and no SD removal.
-// BLE cannot run while WiFi does (see the coexistence note in setup()), so this mode PAUSES
-// monitoring - hence the loud on-screen warning and the automatic return below.
-#define AP_SSID    "BabyVitals"
-#define AP_PASS    "babyvitals"   // WPA2 needs >=8 chars. Shown on screen, so nothing to memorise.
-#define EXPORT_TIMEOUT_MS 600000  // resume monitoring by itself after 10 min, in case of a stray swipe
-// Gesture thresholds. The swipe must cross more than half the 240 px height and be clearly more
-// vertical than horizontal, so brushing the screen while moving the board cannot stop monitoring.
-#define SWIPE_MIN_DY  130         // px of vertical travel before it counts as a swipe
-#define TAP_MAX_MOVE  20          // px; anything that moves further than this is not a tap
-#define SD_SCK 18
-#define SD_MISO 19
-#define SD_MOSI 23
-#define SD_CS 5
-// XPT2046 touch (bit-banged)
-#define T_CLK 25
-#define T_MOSI 32
-#define T_MISO 39
-#define T_CS 33
-#define T_IRQ 36
-// touch calibration (from 5-point cal). TOUCH_ prefix on purpose: bare TX1/RX1 etc. are already
-// UART pin macros in the ESP32 core, and redefining them here shadowed the core's values.
-#define TOUCH_X0 170
-#define TOUCH_X1 3840
-#define TOUCH_Y0 320
-#define TOUCH_Y1 3760
+// =================================================================================================
+// Sketch-local types
+// =================================================================================================
+// Defined before any function on purpose: the Arduino preprocessor inserts generated prototypes for
+// every function ahead of the first definition, so a type used in a signature has to exist by then.
 
-class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ILI9342 _panel; lgfx::Bus_SPI _bus; lgfx::Light_PWM _light;
-public:
-  LGFX() {
-    { auto c=_bus.config(); c.spi_host=HSPI_HOST; c.spi_mode=0; c.freq_write=40000000; c.freq_read=16000000;
-      c.spi_3wire=false; c.use_lock=true; c.dma_channel=SPI_DMA_CH_AUTO;
-      c.pin_sclk=14; c.pin_mosi=13; c.pin_miso=12; c.pin_dc=2; _bus.config(c); _panel.setBus(&_bus); }
-    { auto c=_panel.config(); c.pin_cs=15; c.pin_rst=-1; c.pin_busy=-1;
-      c.panel_width=320; c.panel_height=240; c.offset_x=0; c.offset_y=0; c.offset_rotation=0;
-      c.readable=true; c.invert=false; c.rgb_order=true; c.dlen_16bit=false; c.bus_shared=true; _panel.config(c); }  // BGR panel: fixes red/blue swap
-    { auto c=_light.config(); c.pin_bl=21; c.invert=false; c.freq=44100; c.pwm_channel=7; _light.config(c); _panel.setLight(&_light); }
-    setPanel(&_panel);
-  }
-};
-LGFX tft;
-SPIClass sdSPI(VSPI);
+enum class View : uint8_t { LIVE, PLOT, EXPORT, MAINTENANCE, ALARM };
 
-// ---------- shared vitals ----------
-ReadingSnapshot g_reading;
-RateContext g_rateContext;   // the last five minutes of agreeing readings, see band_protocol.h
-portMUX_TYPE g_readingMux = portMUX_INITIALIZER_UNLOCKED;
+// Outcome of the press-and-hold on the HEART cell that starts the alarm self-test.
+enum class HeartHold : uint8_t { NONE, COUNTING, COMPLETED };
 
-ReadingSnapshot readSnapshot() {
-  portENTER_CRITICAL(&g_readingMux);
-  ReadingSnapshot copy = g_reading;
-  portEXIT_CRITICAL(&g_readingMux);
-  return copy;
-}
-
-void publishReading(const BandReading& frame, int rssi, uint32_t nowMs) {
-  portENTER_CRITICAL(&g_readingMux);
-  g_reading = mergeBandReading(g_reading, frame, rssi, nowMs, g_rateContext);
-  portEXIT_CRITICAL(&g_readingMux);
-}
-
-void holdSkinTemperature(float skinC) {
-  if (skinC < BAND_SKIN_MIN_C || skinC > BAND_SKIN_MAX_C) return;
-  portENTER_CRITICAL(&g_readingMux);
-  g_reading.skinC = skinC;
-  g_reading.skinValid = true;
-  portEXIT_CRITICAL(&g_readingMux);
-}
-
-// ---------- protected Bluetooth health telemetry ----------
+// Bluetooth reception counters, written by the BLE task and read by the loop.
 struct RadioRuntime {
   bool scanStarted = false;
   uint32_t scanStartedMs = 0;
@@ -187,16 +85,143 @@ struct RadioRuntime {
   uint32_t restartCount = 0;
 };
 
+struct WifiCredential {
+  String ssid;
+  String password;
+};
+
+// The alarm view repaints its vitals and trace only when one of these changes.
+struct AlarmRenderKey {
+  int sequence = -1;
+  int effectiveHeartRate = 0;
+  int heartRate = 0;
+  int highAlarmHeartRate = 0;
+  int oxygen = 0;
+  bool stale = false;
+  RadioState radioState = RadioState::STARTING;
+};
+
+bool operator==(const AlarmRenderKey& a, const AlarmRenderKey& b) {
+  return a.sequence == b.sequence && a.effectiveHeartRate == b.effectiveHeartRate &&
+         a.heartRate == b.heartRate && a.highAlarmHeartRate == b.highAlarmHeartRate &&
+         a.oxygen == b.oxygen && a.stale == b.stale && a.radioState == b.radioState;
+}
+
+// =================================================================================================
+// Shared state
+// =================================================================================================
+
+CydPanel g_tft;
+Screen g_screen{g_tft, Layout{}, DAY_PALETTE};
+SPIClass g_sdSpi(VSPI);
+
+bool g_sdReady = false;
+bool g_timeReady = false;
+
+// RTC memory survives the deliberate soft reboot after the NTP sync, a watchdog reset and a panic,
+// but not a power cut. That is exactly the distinction the boot log and the alarm latch need.
+RTC_DATA_ATTR bool g_syncedThisPower = false;
+// The real reason this power cycle started. The cold boot has no clock yet and cannot write a
+// timestamped line; by the time the second boot can, esp_reset_reason() only reports our restart.
+RTC_DATA_ATTR esp_reset_reason_t g_originalResetReason = ESP_RST_UNKNOWN;
+// The latch outlives a reboot here. The onset is also written to /alerts.csv the moment it happens
+// and reconciled at boot, which covers the power-cut case.
+RTC_DATA_ATTR AlarmMachine g_alarmHigh;
+RTC_DATA_ATTR AlarmMachine g_alarmLow;
+
+const AlarmConfig ALARM_HIGH_CFG{HR_CRIT,       HR_SUSTAIN,      HR_CANCEL,
+                                 HR_COLLAPSE_FROM, HR_COLLAPSE_TO, CRIT_MIN_HIGH,
+                                 CRIT_CONFIRM_MS,  ALARM_SNOOZE_MS, false,
+                                 CRIT_MIN_CORRECTED, CRIT_CONFIRM_CORRECTED_MS};
+// The collapse thresholds are carried but unused: that rule is high-side only (critical_alarm.h).
+// lowSide = true reads every other comparison the other way up.
+const AlarmConfig ALARM_LOW_CFG{HR_CRIT_LOW,      HR_SUSTAIN_LOW,  HR_CANCEL_LOW,
+                                HR_COLLAPSE_FROM, HR_COLLAPSE_TO,  CRIT_MIN_HIGH,
+                                CRIT_CONFIRM_MS,  ALARM_SNOOZE_MS, true,
+                                CRIT_MIN_CORRECTED, CRIT_CONFIRM_CORRECTED_MS};
+
+History g_history;   // the last hour, for the sparklines and the alarm trace
+DayBins g_dayBins;   // today, for the 24-hour chart
+Contacts g_contacts;
+
+View g_view = View::LIVE;
+DayMetric g_plotMetric = DayMetric::HEART_RATE;
+int g_plotBinMinutes = 60;   // 60, 30 or 15
+uint32_t g_lastTouchMs = 0;
+
+LiveRenderKey g_lastRenderKey;
+bool g_renderKeyValid = false;
+bool g_selfTest = false;
+uint32_t g_selfTestStartMs = 0;
+uint32_t g_spo2StampEpoch = 0;   // when the last non-zero SpO2 arrived, for its age on the alarm screen
+uint32_t g_exportStartMs = 0;
+uint32_t g_maintenanceStartMs = 0;
+bool g_otaUploading = false;   // a transfer is in progress: no timeout, no gestures
+
+GestureTracker g_gesture;
+HoldState g_hold;
+// The one touch sample taken per loop pass, shared by the gesture decoder and the hold countdown.
+bool g_touchDown = false;
+int g_touchX = 0;
+int g_touchY = 0;
+
+// Whichever machine is latched owns the screen. If somehow both are, the fast one wins: a rate
+// above 200 needs a hospital sooner than one below 80.
+AlarmMachine* firingAlarm() {
+  if (g_alarmHigh.state == AlarmState::ALARM) return &g_alarmHigh;
+  if (g_alarmLow.state == AlarmState::ALARM) return &g_alarmLow;
+  return nullptr;
+}
+
+// =================================================================================================
+// Readings: written by the BLE callback, read by the loop
+// =================================================================================================
+
+ReadingSnapshot g_reading;
+RateContext g_rateContext;   // the last five minutes of agreeing readings (band_protocol.h)
+portMUX_TYPE g_readingMux = portMUX_INITIALIZER_UNLOCKED;
+
+ReadingSnapshot readSnapshot() {
+  portENTER_CRITICAL(&g_readingMux);
+  const ReadingSnapshot copy = g_reading;
+  portEXIT_CRITICAL(&g_readingMux);
+  return copy;
+}
+
+void publishReading(const BandReading& frame, int rssi, uint32_t nowMs) {
+  portENTER_CRITICAL(&g_readingMux);
+  g_reading = mergeBandReading(g_reading, frame, rssi, nowMs, g_rateContext);
+  portEXIT_CRITICAL(&g_readingMux);
+}
+
+// The display holds the last valid skin temperature, as the official app does, instead of "--".
+void holdSkinTemperature(float skinC) {
+  if (skinC < BAND_SKIN_MIN_C || skinC > BAND_SKIN_MAX_C) return;
+  portENTER_CRITICAL(&g_readingMux);
+  g_reading.skinC = skinC;
+  g_reading.skinValid = true;
+  portEXIT_CRITICAL(&g_readingMux);
+}
+
+bool readingIsFresh(const ReadingSnapshot& r, uint32_t nowMs) {
+  return r.lastPacketMs != 0 && static_cast<uint32_t>(nowMs - r.lastPacketMs) < READING_FRESH_MS;
+}
+
+bool readingIsStale(const ReadingSnapshot& r, uint32_t nowMs) {
+  return r.lastPacketMs == 0 || static_cast<uint32_t>(nowMs - r.lastPacketMs) > STALE_MS;
+}
+
+// =================================================================================================
+// Radio: passive BLE scan
+// =================================================================================================
+
 RadioRuntime g_radio;
 portMUX_TYPE g_radioMux = portMUX_INITIALIZER_UNLOCKED;
 BLEScan* g_bleScanner = nullptr;
 
-RadioRuntime readRadioRuntime();
-RadioState classifyRadio(uint32_t nowMs, const RadioRuntime& radio);
-
 RadioRuntime readRadioRuntime() {
   portENTER_CRITICAL(&g_radioMux);
-  RadioRuntime copy = g_radio;
+  const RadioRuntime copy = g_radio;
   portEXIT_CRITICAL(&g_radioMux);
   return copy;
 }
@@ -218,10 +243,12 @@ void noteBandAdvertisement(uint32_t nowMs) {
 }
 
 bool startBleScan(uint32_t nowMs) {
+  // Passive: never transmit a scan request. Required by the receive-only rule, and everything the
+  // board decodes is in the advertisement itself.
   g_bleScanner->setActiveScan(false);
   g_bleScanner->setInterval(SCAN_INTERVAL_MS);
   g_bleScanner->setWindow(SCAN_WINDOW_MS);
-  bool started = g_bleScanner->start(0, nullptr, false);
+  const bool started = g_bleScanner->start(0, nullptr, false);
   portENTER_CRITICAL(&g_radioMux);
   g_radio.scanStarted = started;
   g_radio.scanStartedMs = nowMs;
@@ -242,25 +269,15 @@ RadioState classifyRadio(uint32_t nowMs, const RadioRuntime& radio) {
   return classifyRadioHealth(input);
 }
 
-const char* radioStateLabel(RadioState state) {
-  switch (state) {
-    case RadioState::STARTING: return "STARTING";
-    case RadioState::RECEIVING: return "RECEIVING";
-    case RadioState::BAND_MISSING: return "BAND_MISSING";
-    case RadioState::SCANNER_SILENT: return "SCANNER_SILENT";
-  }
-  return "UNKNOWN";
-}
-
+// Logs every state change and restarts a silent scanner, rate-limited by radio_health.h.
 RadioState serviceRadioRecovery(uint32_t nowMs) {
-  RadioRuntime radio = readRadioRuntime();
-  RadioState state = classifyRadio(nowMs, radio);
+  const RadioRuntime radio = readRadioRuntime();
+  const RadioState state = classifyRadio(nowMs, radio);
+
   static bool havePrevious = false;
   static RadioState previous = RadioState::STARTING;
-
   if (!havePrevious || state != previous) {
-    Serial.printf("[ble] state=%s total=%lu band=%lu restarts=%lu\n",
-                  radioStateLabel(state),
+    Serial.printf("[ble] state=%s total=%lu band=%lu restarts=%lu\n", radioStateName(state),
                   static_cast<unsigned long>(radio.totalAdvertisements),
                   static_cast<unsigned long>(radio.bandAdvertisements),
                   static_cast<unsigned long>(radio.restartCount));
@@ -268,11 +285,9 @@ RadioState serviceRadioRecovery(uint32_t nowMs) {
     havePrevious = true;
   }
 
-  if (!shouldRestartScan(state, radio.restartAttempted, nowMs,
-                         radio.lastRestartAttemptMs)) {
+  if (!shouldRestartScan(state, radio.restartAttempted, nowMs, radio.lastRestartAttemptMs)) {
     return state;
   }
-
   portENTER_CRITICAL(&g_radioMux);
   g_radio.restartAttempted = true;
   g_radio.lastRestartAttemptMs = nowMs;
@@ -285,107 +300,71 @@ RadioState serviceRadioRecovery(uint32_t nowMs) {
   return classifyRadio(millis(), readRadioRuntime());
 }
 
-bool g_timeReady=false, g_sdReady=false;
-RTC_DATA_ATTR bool g_syncedThisPower=false;   // survives the soft reboot below
-// The real reason this power cycle started, carried across the deliberate NTP soft-reboot below.
-// Without this every restart would be recorded as SW: the cold boot has no clock yet, so it cannot
-// write a timestamped line, and by the time boot 2 can, esp_reset_reason() only reports our own
-// ESP.restart(). RTC memory survives a SW reset but not a power cut, which is exactly the
-// distinction logBoot() needs.
-RTC_DATA_ATTR esp_reset_reason_t g_origReason=ESP_RST_UNKNOWN;
-// The alarm latch must outlive a watchdog reset, a panic and the NTP soft reboot, so it lives in
-// RTC memory alongside g_origReason. RTC memory does NOT survive a power cut, which is why the
-// onset is also written to /alerts.csv the moment it happens and reconciled at boot.
-RTC_DATA_ATTR AlarmMachine g_alarm;
-RTC_DATA_ATTR AlarmMachine g_alarmLow;
-const AlarmConfig ALARM_CFG{HR_CRIT,HR_SUSTAIN,HR_CANCEL,HR_COLLAPSE_FROM,HR_COLLAPSE_TO,
-                            CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS,false,
-                            CRIT_MIN_CORRECTED,CRIT_CONFIRM_CORRECTED_MS};
-// Collapse thresholds are carried but unused: the collapse rule is high-side only, see
-// critical_alarm.h. The trailing true is what makes every comparison read the other way up.
-const AlarmConfig ALARM_LOW_CFG{HR_CRIT_LOW,HR_SUSTAIN_LOW,HR_CANCEL_LOW,
-                                HR_COLLAPSE_FROM,HR_COLLAPSE_TO,
-                                CRIT_MIN_HIGH,CRIT_CONFIRM_MS,ALARM_SNOOZE_MS,true,
-                                CRIT_MIN_CORRECTED,CRIT_CONFIRM_CORRECTED_MS};
-
-// Two machines, one screen. Whichever is latched owns the display; if somehow both are, the fast
-// one wins, because a rate above 200 needs a hospital sooner than one below 80.
-inline AlarmMachine* firingAlarm(){
-  if(g_alarm.state==AlarmState::ALARM) return &g_alarm;
-  if(g_alarmLow.state==AlarmState::ALARM) return &g_alarmLow;
-  return nullptr;
-}
-Contacts g_contacts;
-HoldState g_hold;
-int g_alarmKey=0; bool g_alarmKeyValid=false;
-bool g_selfTest=false; uint32_t g_selfTestStart=0;
-uint32_t g_spo2StampEpoch=0;
-// ---------- rolling ~1-hour history for the mini sparklines (~180 readings @ ~20s) ----------
-// histEpoch gives the trace a real time axis. Without it a four-minute dropout draws as a
-// straight line between two adjacent samples, which reads as a steady rate for four minutes -
-// the opposite of what happened. 720 bytes buys the difference between "we don't know" and a
-// confident lie, and the alarm trace is read precisely when dropouts are most likely.
-#define HN 180
-uint8_t hrHist[HN], spHist[HN]; uint32_t histEpoch[HN]; int histHead=0, histCnt=0;
-void pushHist(int hr,int sp,uint32_t epoch){
-  hrHist[histHead]=constrain(hr,0,254); spHist[histHead]=constrain(sp,0,254);
-  histEpoch[histHead]=epoch;
-  histHead=(histHead+1)%HN; if(histCnt<HN) histCnt++;
-}
-
-class CB : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice dev) override {
-    uint32_t nowMs = millis();
+class BandScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice device) override {
+    const uint32_t nowMs = millis();
     noteAnyAdvertisement(nowMs);
-    if (!dev.haveManufacturerData()) return;
-    String manufacturer = dev.getManufacturerData();
+    if (!device.haveManufacturerData()) return;
+    const String manufacturer = device.getManufacturerData();
     BandReading decoded{};
-    if (!decodeBandFrame(
-            reinterpret_cast<const uint8_t*>(manufacturer.c_str()),
-            manufacturer.length(), decoded)) {
+    if (!decodeBandFrame(reinterpret_cast<const uint8_t*>(manufacturer.c_str()),
+                         manufacturer.length(), decoded)) {
       return;
     }
     noteBandAdvertisement(nowMs);
-    publishReading(decoded, dev.getRSSI(), nowMs);
+    publishReading(decoded, device.getRSSI(), nowMs);
   }
 };
 
-// ---------- 24h bins (96 x 15-min) ----------
-struct Bin { uint16_t nH, nO; float sH, sqH, sO, sqO; };
-Bin bins[96];
-void addReading(int hr, int spo2, int minOfDay) {
-  int b = minOfDay/15; if (b<0||b>=96) return;
-  if (hr>0)  { bins[b].nH++; bins[b].sH+=hr;  bins[b].sqH+=(float)hr*hr; }
-  if (spo2>0){ bins[b].nO++; bins[b].sO+=spo2;bins[b].sqO+=(float)spo2*spo2; }
-}
+// =================================================================================================
+// Clock
+// =================================================================================================
 
-// ---------- SD + WiFi + NTP ----------
-constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
-constexpr uint32_t NTP_TIMEOUT_MS = 15000;
-constexpr char TZ_INFO[] = "CET-1CEST,M3.5.0,M10.5.0/3";
-constexpr char NTP_SERVER_1[] = "pool.ntp.org";
-constexpr char NTP_SERVER_2[] = "time.nist.gov";
-
-struct WifiCredential {
-  String ssid;
-  String password;
-};
-
-bool loadWifiCredential(WifiSlot slot, WifiCredential& out);
-bool tryWifiSlot(WifiSlot slot);
-
-bool initSD() {
-  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  g_sdReady = SD.begin(SD_CS, sdSPI) && SD.cardType()!=CARD_NONE;
-  Serial.println(g_sdReady?"[SD] OK":"[SD] FAILED"); return g_sdReady;
-}
+// tm_year counts from 1900. Anything before 2020 is the unset epoch, not a real time.
+constexpr int CLOCK_SET_MIN_TM_YEAR = 120;
 
 bool readLocalClock(struct tm& out) {
   time_t now;
   time(&now);
   localtime_r(&now, &out);
-  return out.tm_year > 120;
+  return out.tm_year > CLOCK_SET_MIN_TM_YEAR;
 }
+
+// 0 means "no usable timestamp". The alarm trace then falls back to a positional axis and says so,
+// rather than placing samples at epoch zero and drawing a confident wrong time axis.
+uint32_t nowEpochOrZero() {
+  struct tm tm{};
+  if (!readLocalClock(tm)) return 0;
+  return static_cast<uint32_t>(mktime(&tm));
+}
+
+// Rows in today's CSV carry a time of day; combined with today's date they land on the same axis as
+// live readings. Seconds matter: readings arrive about every 20 s, so quantising to the minute would
+// stack several on one x position and turn a real dropout into an apparent one.
+uint32_t epochForTodayAt(int hh, int mm, int ss) {
+  struct tm tm{};
+  if (!readLocalClock(tm)) return 0;
+  tm.tm_hour = hh;
+  tm.tm_min = mm;
+  tm.tm_sec = ss;
+  return static_cast<uint32_t>(mktime(&tm));
+}
+
+// "HH:MM", or an empty string until the clock is set.
+void clockText(char* out, size_t cap) {
+  struct tm tm{};
+  if (cap == 0) return;
+  out[0] = '\0';
+  if (readLocalClock(tm)) strftime(out, cap, "%H:%M", &tm);
+}
+
+int minuteOfDay() {
+  struct tm tm{};
+  if (!readLocalClock(tm)) return -1;
+  return tm.tm_hour * 60 + tm.tm_min;
+}
+
+// ---- WiFi + NTP: once per power cycle, then off for good ----------------------------------------
 
 bool loadWifiCredential(WifiSlot slot, WifiCredential& out) {
   File file = SD.open(wifiCredentialPath(slot));
@@ -398,39 +377,47 @@ bool loadWifiCredential(WifiSlot slot, WifiCredential& out) {
   return out.ssid.length() > 0;
 }
 
-bool tryWifiSlot(WifiSlot slot) {
+// Loads one slot's credentials and connects. Leaves the connection up on success. Credentials are
+// never logged.
+bool connectWifiSlot(WifiSlot slot) {
   WifiCredential credential;
   if (!loadWifiCredential(slot, credential)) {
-    credential.password = "";
     Serial.printf("[wifi] %s unavailable\n", wifiSlotLabel(slot));
     return false;
   }
-
   Serial.printf("[wifi] trying %s\n", wifiSlotLabel(slot));
   WiFi.begin(credential.ssid.c_str(), credential.password.c_str());
-  uint32_t startedMs = millis();
+  credential.password = "";
+  const uint32_t startedMs = millis();
   while (WiFi.status() != WL_CONNECTED &&
          static_cast<uint32_t>(millis() - startedMs) < WIFI_CONNECT_TIMEOUT_MS) {
     delay(250);
   }
+  if (WiFi.status() == WL_CONNECTED) return true;
+  Serial.printf("[wifi] %s failed\n", wifiSlotLabel(slot));
+  WiFi.disconnect(false, false);
+  delay(100);
+  return false;
+}
 
-  bool synced = false;
-  if (WiFi.status() == WL_CONNECTED) {
-    configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
-    startedMs = millis();
-    struct tm localTime{};
-    while (static_cast<uint32_t>(millis() - startedMs) < NTP_TIMEOUT_MS) {
-      if (getLocalTime(&localTime, 200) && localTime.tm_year > 120) {
-        synced = true;
-        break;
-      }
-      delay(50);
-    }
+// Waits for NTP on the current connection.
+bool syncNtp() {
+  configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+  const uint32_t startedMs = millis();
+  struct tm localTime{};
+  while (static_cast<uint32_t>(millis() - startedMs) < NTP_TIMEOUT_MS) {
+    if (getLocalTime(&localTime, 200) && localTime.tm_year > CLOCK_SET_MIN_TM_YEAR) return true;
+    delay(50);
   }
+  return false;
+}
 
-  Serial.printf("[wifi] %s %s\n", wifiSlotLabel(slot),
-                synced ? "time-synced" : "failed");
-  credential.password = "";
+// One slot's attempt at setting the clock. The connection is dropped either way: at boot the
+// network is only borrowed for the time.
+bool tryWifiSlotForTime(WifiSlot slot) {
+  if (!connectWifiSlot(slot)) return false;
+  const bool synced = syncNtp();
+  Serial.printf("[wifi] %s %s\n", wifiSlotLabel(slot), synced ? "time-synced" : "ntp failed");
   WiFi.disconnect(false, false);
   delay(100);
   return synced;
@@ -446,792 +433,946 @@ void shutdownWifi() {
 bool syncTimeOverWifi() {
   if (!g_sdReady) return false;
   WiFi.mode(WIFI_STA);
-  bool synced = runWifiFailover(
-      [](WifiSlot slot) { return tryWifiSlot(slot); });
+  const bool synced = runWifiFailover([](WifiSlot slot) { return tryWifiSlotForTime(slot); });
   shutdownWifi();
   return synced;
 }
-// One definition of the log filename: the writer (logRow) and the reader (loadCsvToday) must never
-// disagree about which file "today" is.
-void csvName(char* out,const struct tm* tm){ strftime(out,32,"/vitals_%Y-%m-%d.csv",tm); }
-void csvName(char* out){ struct tm tm{}; if(readLocalClock(tm)) csvName(out,&tm); else out[0]='\0'; }
-// 0 means "no usable timestamp" - the trace falls back to a positional axis and says so, rather
-// than placing samples at epoch zero and drawing a confident wrong time axis.
-uint32_t nowEpochOrZero(){ struct tm tm{}; if(!readLocalClock(tm)) return 0; return (uint32_t)mktime(&tm); }
-// Rows in today's CSV carry a full timestamp; combine it with today's date so reloaded history
-// lands on the same axis as live readings. Seconds matter: readings arrive about every 22 s, so
-// quantising to the minute would stack two or three of them on one x-position and turn a real
-// dropout into an apparent one.
-uint32_t csvRowEpoch(int hh,int mm,int ss){
-  struct tm tm{}; if(!readLocalClock(tm)) return 0;
-  tm.tm_hour=hh; tm.tm_min=mm; tm.tm_sec=ss;
-  return (uint32_t)mktime(&tm);
-}
-void logRow(int hr,int spo2,float skin,bool sv,int beatMs,int hrEff){
-  if(!g_sdReady||!g_timeReady) return; struct tm tm{}; if(!readLocalClock(tm)) return;
-  char fn[32]; csvName(fn,&tm); bool isNew=!SD.exists(fn);
-  File f=SD.open(fn,FILE_APPEND); if(!f) return;
-  if(isNew) f.println(VITALS_CSV_HEADER);
-  char ts[24]; strftime(ts,24,"%F %T",&tm);
-  // hr is the band's own byte and hrEff is what the screen, the plots and the alarms used. A day
-  // that started before this firmware keeps its four-column header and gains six-column rows;
-  // parseVitalsRow() reads both, which is what makes the upgrade safe mid-day.
-  char row[80]; formatVitalsRow(row,sizeof(row),ts,hr,spo2,skin,sv,beatMs,hrEff);
-  f.println(row);
-  f.close();
-}
-// /alerts.csv is append-only. Rewriting a row in place on an SD card is not crash-safe; appending
-// events is, so a brownout mid-episode still leaves a readable file and an open episode.
-void logAlert(const char* event,int hr,int spo2,const char* detail){
-  if(!g_sdReady) return; struct tm tm{}; if(!readLocalClock(tm)) return;
-  char ts[24]; strftime(ts,sizeof(ts),"%F %T",&tm);
-  bool isNew=!SD.exists("/alerts.csv");
-  File f=SD.open("/alerts.csv",FILE_APPEND); if(!f) return;
-  if(isNew) f.println("timestamp,event,hr_bpm,spo2_pct,detail");
-  char row[128]; formatAlertRow(row,sizeof(row),ts,event,hr,spo2,detail);
-  f.println(row); f.close();
+
+// =================================================================================================
+// Storage: microSD card
+// =================================================================================================
+
+constexpr char VITALS_CSV_NAME_FORMAT[] = "/vitals_%Y-%m-%d.csv";
+constexpr char ALERTS_CSV_PATH[] = "/alerts.csv";
+constexpr char ALERTS_CSV_HEADER[] = "timestamp,event,hr_bpm,spo2_pct,detail";
+constexpr char BOOT_LOG_PATH[] = "/boot.log";
+constexpr char CONTACTS_PATH[] = "/contacts.txt";
+constexpr char TIMESTAMP_FORMAT[] = "%F %T";   // "YYYY-MM-DD HH:MM:SS"
+
+bool initSd() {
+  g_sdSpi.begin(SD_PIN_SCK, SD_PIN_MISO, SD_PIN_MOSI, SD_PIN_CS);
+  g_sdReady = SD.begin(SD_PIN_CS, g_sdSpi) && SD.cardType() != CARD_NONE;
+  Serial.println(g_sdReady ? "[sd] OK" : "[sd] FAILED");
+  return g_sdReady;
 }
 
-// The repository ships no /contacts.txt and contains no real numbers: this project is published
-// for other people to build, and compiling one family's hospital numbers into it would put those
-// numbers on a stranger's screen during their emergency.
-void loadContacts(){
-  g_contacts=Contacts{};
-  if(!g_sdReady) return;
-  File f=SD.open("/contacts.txt",FILE_READ); if(!f) return;
-  char buf[128]; size_t n=f.readBytes(buf,sizeof(buf)-1); buf[n]='\0'; f.close();
-  parseContacts(buf,g_contacts);
+// One definition of the daily filename: the writer and the reader must never disagree about which
+// file "today" is.
+void vitalsCsvName(char* out, size_t cap, const struct tm& tm) {
+  strftime(out, cap, VITALS_CSV_NAME_FORMAT, &tm);
+}
+
+void logVitalsRow(const ReadingSnapshot& r) {
+  if (!g_sdReady || !g_timeReady) return;
+  struct tm tm{};
+  if (!readLocalClock(tm)) return;
+  char name[32];
+  vitalsCsvName(name, sizeof(name), tm);
+  const bool isNew = !SD.exists(name);
+  File file = SD.open(name, FILE_APPEND);
+  if (!file) return;
+  if (isNew) file.println(VITALS_CSV_HEADER);
+  char timestamp[24];
+  strftime(timestamp, sizeof(timestamp), TIMESTAMP_FORMAT, &tm);
+  // hr_bpm is the band's own byte and hr_eff is what the screen, plots and alarms used. A day that
+  // started before this firmware keeps its older header and gains wider rows; parseVitalsRow()
+  // reads both.
+  char row[80];
+  formatVitalsRow(row, sizeof(row), timestamp, r.heartRate, r.oxygenSaturation, r.skinC,
+                  r.skinValid, r.beatMs, r.effectiveHeartRate);
+  file.println(row);
+  file.close();
+}
+
+// Append-only: rewriting a row in place on an SD card is not crash-safe, and a brownout mid-episode
+// must still leave a readable file with an open episode in it.
+void logAlert(const char* event, int hr, int spo2, const char* detail) {
+  if (!g_sdReady) return;
+  struct tm tm{};
+  if (!readLocalClock(tm)) return;
+  char timestamp[24];
+  strftime(timestamp, sizeof(timestamp), TIMESTAMP_FORMAT, &tm);
+  const bool isNew = !SD.exists(ALERTS_CSV_PATH);
+  File file = SD.open(ALERTS_CSV_PATH, FILE_APPEND);
+  if (!file) return;
+  if (isNew) file.println(ALERTS_CSV_HEADER);
+  char row[128];
+  formatAlertRow(row, sizeof(row), timestamp, event, hr, spo2, detail);
+  file.println(row);
+  file.close();
+}
+
+// The repository ships no /contacts.txt: one family's hospital numbers must never end up on a
+// stranger's screen.
+void loadContacts() {
+  g_contacts = Contacts{};
+  if (!g_sdReady) return;
+  File file = SD.open(CONTACTS_PATH, FILE_READ);
+  if (!file) return;
+  char buf[128];
+  const size_t n = file.readBytes(buf, sizeof(buf) - 1);
+  buf[n] = '\0';
+  file.close();
+  parseContacts(buf, g_contacts);
+}
+
+// The over-the-air update password. Like the WiFi credentials it lives on the card, never in code.
+bool loadOtaPassword(char* out, size_t cap) {
+  if (!g_sdReady) return false;
+  File file = SD.open(OTA_PASSWORD_PATH, FILE_READ);
+  if (!file) return false;
+  char buf[128];
+  const size_t n = file.readBytes(buf, sizeof(buf) - 1);
+  buf[n] = '\0';
+  file.close();
+  const bool ok = parseOtaPassword(buf, out, cap);
+  memset(buf, 0, sizeof(buf));
+  return ok;
 }
 
 // An ONSET with no later DISMISS means the board died mid-episode. Coming back up silent would be
 // the worst possible behaviour, so the alarm is re-entered.
-void reconcileOpenEpisode(){
-  if(!g_sdReady||!g_timeReady) return;
-  File f=SD.open("/alerts.csv",FILE_READ); if(!f) return;
+void reconcileOpenEpisode() {
+  if (!g_sdReady || !g_timeReady) return;
+  File file = SD.open(ALERTS_CSV_PATH, FILE_READ);
+  if (!file) return;
   OpenEpisode open{};
-  while(f.available()){
-    String ln=f.readStringUntil('\n'); if(ln.length()<20) continue;
-    struct tm tm{}; if(strptime(ln.c_str(),"%Y-%m-%d %H:%M:%S",&tm)==nullptr) continue;
-    reconcileAlertLine(ln.c_str(),(uint32_t)mktime(&tm),open);
+  while (file.available()) {
+    const String line = file.readStringUntil('\n');
+    if (line.length() < 20) continue;
+    struct tm tm{};
+    if (strptime(line.c_str(), "%Y-%m-%d %H:%M:%S", &tm) == nullptr) continue;
+    reconcileAlertLine(line.c_str(), static_cast<uint32_t>(mktime(&tm)), open);
   }
-  f.close();
-  if(open.open && firingAlarm()==nullptr){
-    AlarmMachine& m = open.low ? g_alarmLow : g_alarm;
-    m.state=AlarmState::ALARM;
-    m.cause = open.low ? AlarmCause::CONFIRMED_LOW
-                       : (open.beat ? AlarmCause::CONFIRMED_HIGH_BEAT
-                                    : AlarmCause::CONFIRMED_HIGH);
-    m.onsetEpoch=open.onsetEpoch; m.resolved=false;
-    logAlert("BOOT_RESUME",0,0,"recovered from card");
-  }
+  file.close();
+  if (!open.open || firingAlarm() != nullptr) return;
+
+  AlarmMachine& m = open.low ? g_alarmLow : g_alarmHigh;
+  m.state = AlarmState::ALARM;
+  m.cause = open.low ? AlarmCause::CONFIRMED_LOW
+            : open.beat ? AlarmCause::CONFIRMED_HIGH_BEAT
+                        : AlarmCause::CONFIRMED_HIGH;
+  m.onsetEpoch = open.onsetEpoch;
+  m.resolved = false;
+  logAlert("BOOT_RESUME", 0, 0, "recovered from card");
 }
 
-void loadCsvToday(){
-  if(!g_sdReady||!g_timeReady) return; char fn[32]; csvName(fn);
-  File f=SD.open(fn); if(!f){Serial.println("[csv] no file to load");return;}
-  f.readStringUntil('\n'); int n=0;
-  while(f.available()){
-    String ln=f.readStringUntil('\n'); ln.trim();
-    VitalsRow row;
-    if(!parseVitalsRow(ln.c_str(),row)) continue;
-    // The charts are redrawn from the corrected rate where the file has one, and from the raw
-    // byte for every row written before the correction existed.
-    const int hr=vitalsRowHistoryHr(row);
-    addReading(hr,row.spo2,row.hh*60+row.mm);
-    pushHist(hr,row.spo2,csvRowEpoch(row.hh,row.mm,row.ss)); n++;   // last HN kept -> ~1h sparkline survives reboot
-    // remember the last valid skin temp so the display holds it (like the app) instead of "--"
-    if(row.skinValid && row.skinC>=BAND_SKIN_MIN_C && row.skinC<=BAND_SKIN_MAX_C)
-      holdSkinTemperature(row.skinC);
+// Refills the 24-hour bins and the one-hour history from today's file, so the charts survive a
+// power cycle.
+void loadTodayFromCsv() {
+  if (!g_sdReady || !g_timeReady) return;
+  struct tm tm{};
+  if (!readLocalClock(tm)) return;
+  char name[32];
+  vitalsCsvName(name, sizeof(name), tm);
+  File file = SD.open(name);
+  if (!file) {
+    Serial.println("[csv] no file to load");
+    return;
   }
-  f.close();
-  ReadingSnapshot held = readSnapshot();
-  Serial.printf("[csv] loaded %d rows into bins (heldSkin=%.1f valid=%d)\n",n,held.skinC,held.skinValid);
+  file.readStringUntil('\n');   // header
+  int rows = 0;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    VitalsRow row;
+    if (!parseVitalsRow(line.c_str(), row)) continue;
+    // The corrected rate where the file has one, the raw byte for rows written before it existed.
+    const int hr = vitalsRowHistoryHr(row);
+    dayBinsAdd(g_dayBins, hr, row.spo2, row.hh * 60 + row.mm);
+    historyPush(g_history, hr, row.spo2, epochForTodayAt(row.hh, row.mm, row.ss));
+    if (row.skinValid) holdSkinTemperature(row.skinC);
+    ++rows;
+  }
+  file.close();
+  const ReadingSnapshot held = readSnapshot();
+  Serial.printf("[csv] loaded %d rows (held skin %.1f valid=%d)\n", rows,
+                static_cast<double>(held.skinC), held.skinValid);
 }
-// Why the board restarted, appended to its own file so the CSV format the report app parses is
-// untouched. There is no current meter on this build, so this is the only evidence that separates
-// the three candidate causes of a dead screen in the morning:
-//   POWERON  - cold boot or supply interruption    -> confirms neither the source nor the cause
-//   BROWNOUT - the ESP32 supply fell too low       -> check the 5 V source, cable and regulator
-//   PANIC/WDT/TASK_WDT - firmware crashed          -> investigate the software path
-// A single POWERON when you plug it in is normal. Extra entries overnight need investigation.
-void logBoot(){
-  if(!g_sdReady || !g_timeReady) return;
-  const char* r; switch(g_origReason){
-    case ESP_RST_POWERON:  r="POWERON";  break;   case ESP_RST_BROWNOUT: r="BROWNOUT"; break;
-    case ESP_RST_SW:       r="SW";       break;   case ESP_RST_PANIC:    r="PANIC";    break;
-    case ESP_RST_INT_WDT:  r="INT_WDT";  break;   case ESP_RST_TASK_WDT: r="TASK_WDT"; break;
-    case ESP_RST_WDT:      r="WDT";      break;   case ESP_RST_DEEPSLEEP:r="DEEPSLEEP";break;
-    case ESP_RST_EXT:      r="EXT";      break;   // EN pin pulled low - i.e. a flash/serial reset
-    default:               r="OTHER";    break; }
-  // The numeric code goes in too: a bare "OTHER" at 03:00 is a dead end, and the enum has more
-  // members (USB, JTAG, CPU_LOCKUP, PWR_GLITCH) than are worth spelling out here.
-  File f=SD.open("/boot.log",FILE_APPEND); if(!f) return;
-  struct tm tm{}; char ts[24]="?";
-  if(readLocalClock(tm)) strftime(ts,24,"%F %T",&tm);
-  f.printf("%s,%s,%d\n",ts,r,(int)g_origReason); f.close();
-  Serial.printf("[boot] %s reset=%s(%d)\n",ts,r,(int)g_origReason);
+
+// Why the board restarted, appended to its own file so the CSV format stays untouched. With no
+// current meter on the board this is the only evidence separating the causes of a dead screen in
+// the morning: POWERON is a cold boot or supply interruption, BROWNOUT a supply that fell too low,
+// PANIC or a watchdog a firmware fault. One POWERON when it is plugged in is normal.
+void logBoot() {
+  if (!g_sdReady || !g_timeReady) return;
+  const char* reason = "OTHER";
+  switch (g_originalResetReason) {
+    case ESP_RST_POWERON: reason = "POWERON"; break;
+    case ESP_RST_BROWNOUT: reason = "BROWNOUT"; break;
+    case ESP_RST_SW: reason = "SW"; break;
+    case ESP_RST_PANIC: reason = "PANIC"; break;
+    case ESP_RST_INT_WDT: reason = "INT_WDT"; break;
+    case ESP_RST_TASK_WDT: reason = "TASK_WDT"; break;
+    case ESP_RST_WDT: reason = "WDT"; break;
+    case ESP_RST_DEEPSLEEP: reason = "DEEPSLEEP"; break;
+    case ESP_RST_EXT: reason = "EXT"; break;   // EN pin pulled low: a flash or serial reset
+    default: break;
+  }
+  File file = SD.open(BOOT_LOG_PATH, FILE_APPEND);
+  if (!file) return;
+  struct tm tm{};
+  char timestamp[24] = "?";
+  if (readLocalClock(tm)) strftime(timestamp, sizeof(timestamp), TIMESTAMP_FORMAT, &tm);
+  // The numeric code goes in too: the enum has more members than are worth naming here.
+  // The running slot says which of the two firmware images booted, the first question after an
+  // over-the-air update.
+  const char* slot = runningPartitionLabel();
+  file.printf("%s,%s,%d,%s\n", timestamp, reason, static_cast<int>(g_originalResetReason), slot);
+  file.close();
+  Serial.printf("[boot] %s reset=%s(%d) slot=%s\n", timestamp, reason,
+                static_cast<int>(g_originalResetReason), slot);
 }
-bool nowHM(char* o){ struct tm tm{}; if(!readLocalClock(tm))return false; strftime(o,8,"%H:%M",&tm); return true; }
-int minuteOfDay(){ struct tm tm{}; if(!readLocalClock(tm))return -1; return tm.tm_hour*60+tm.tm_min; }
-// The night window moves once a day, and the render loop asks about it every 30 s, so it is
-// computed on the first call of each new date and cached. tm_gmtoff carries whatever offset the
-// configured timezone has in effect that day, so the March and October changeovers need no special
-// case here - the window simply shifts with the clocks.
-NightWindow currentNightWindow(const struct tm& local, time_t nowT){
+
+// =================================================================================================
+// Backlight and theme
+// =================================================================================================
+
+// The night window moves once a day and the loop asks about it every few seconds, so it is computed
+// on the first call of each new date and cached. The UTC offset comes from the configured timezone,
+// so the March and October changeovers need no special case: the window shifts with the clocks.
+NightWindow currentNightWindow(const struct tm& local, time_t now) {
   static NightWindow cached;
-  static int cachedYday=-1, cachedYear=-1;
-  if(local.tm_yday!=cachedYday || local.tm_year!=cachedYear){
-    struct tm utc{}; gmtime_r(&nowT,&utc);
-    cached=nightWindowFor(solarTimesForDay(local.tm_year+1900, local.tm_yday,
-                                           SITE_LATITUDE_DEG, SITE_LONGITUDE_DEG,
-                                           utcOffsetMinutes(local,utc)));
-    cachedYday=local.tm_yday; cachedYear=local.tm_year;
+  static int cachedYday = -1;
+  static int cachedYear = -1;
+  if (local.tm_yday != cachedYday || local.tm_year != cachedYear) {
+    struct tm utc{};
+    gmtime_r(&now, &utc);
+    cached = nightWindowFor(solarTimesForDay(local.tm_year + 1900, local.tm_yday,
+                                             SITE_LATITUDE_DEG, SITE_LONGITUDE_DEG,
+                                             utcOffsetMinutes(local, utc)));
+    cachedYday = local.tm_yday;
+    cachedYear = local.tm_year;
   }
   return cached;
 }
-// The theme and the backlight need the same two facts - where we are in the local day, and which
-// night window that day has - so they are read together and can never disagree.
-bool localDayState(int& minuteOut, NightWindow& windowOut){
-  time_t now; time(&now);
-  struct tm local{}; localtime_r(&now,&local);
-  if(local.tm_year<=120) return false;               // clock not set yet
-  minuteOut=local.tm_hour*60+local.tm_min;
-  windowOut=currentNightWindow(local,now);
-  return true;
-}
-// "Night" here means the dark theme, which cannot fade and so flips in one step, at the moment the
-// backlight starts fading down. Gated on g_timeReady: without a valid clock the day look is the
-// safe default.
-bool isNight(){
-  if(FORCE_NIGHT) return true;
-  if(!g_timeReady) return false;
-  int m; NightWindow w;
-  if(!localDayState(m,w)) return false;
-  return isNightAt(m,w);
-}
-// Backlight level, ramped across both edges rather than stepped. Same fallback as isNight(): an
-// unknown clock means full brightness, never a dark screen nobody asked for.
-int wantBrightness(){
-  if(FORCE_NIGHT) return BRIGHT_NIGHT_LEVEL;
-  int m; NightWindow w;
-  if(!g_timeReady || !localDayState(m,w)) return BRIGHT_DAY_LEVEL;
-  return brightnessAt(m,w);
-}
-void setBacklight(int want){                     // single owner of the PWM; only writes on a change
-  static int cur=-1; if(want!=cur){ tft.setBrightness(want); cur=want; }
-}
-void applyBrightness(){ setBacklight(wantBrightness()); }
 
-// ---------- UI ----------
-// This panel drives its pixels inverted: the code writes TFT_BLACK and the screen shows white.
-// The daytime look below is therefore "white background, dark text" as seen on the device, and it
-// is left exactly as it was. At night every background/chrome colour is replaced by its 16-bit
-// complement, which flips the panel to a black background with light text. The VALUE colours
-// (heart, oxygen, skin, alerts) are deliberately NOT flipped so the numbers keep their usual hues.
-#define INV(c) ((uint16_t)~(uint16_t)(c))
-const uint16_t GREY_D=0x9CD3, DIM_D=0x52AA, LINE_D=0x2965, GRID_D=0x1082, BG_D=TFT_BLACK;
-uint16_t GREY=GREY_D, DIM=DIM_D, LINE=LINE_D, GRID=GRID_D, BG=BG_D;
-int W,H,HDR,COLW,RH;
-enum View { LIVE, PLOT, EXPORT, ALARM };
-View view=LIVE; int plotMetric=0; int plotBinMin=60;   // 60/30/15
-
-// Included here, not with the other headers at the top: it draws, so it needs tft, W, H, DIM and
-// the history buffer to already exist. Kept out of this file so the sketch does not absorb two
-// hundred lines of layout code.
-#include "alarm_render.h"
-uint32_t g_exportStart=0;                              // millis() when export mode began
-LiveRenderKey g_lastRenderKey;
-bool g_renderKeyValid = false;
-
-void cell(int col,int r,const char* label,const char* val,const char* unit,uint16_t color){
-  int x=col*COLW,y=HDR+r*RH;
-  tft.fillRect(x,y,COLW,RH,BG);        // clear our own area, so the live view never full-screen wipes
-  tft.setTextDatum(textdatum_t::top_left); tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(GREY);
-  tft.drawString(label,x+8,y+2);
-  tft.setTextDatum(textdatum_t::bottom_right); tft.drawString(unit,x+COLW-8,y+RH-4);
-  tft.setFont(&fonts::Font7); tft.setTextSize(1); tft.setTextColor(color);
-  tft.setTextDatum(textdatum_t::top_left); tft.drawString(val,x+8,y+20);
-}
-void drawHeader(const ReadingSnapshot& reading,RadioState radioState,bool stale){
-  tft.fillRect(0,2,W,HDR-4,BG);
-  tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextDatum(textdatum_t::top_left);
-  tft.setTextColor(GREY); tft.drawString("Oliwia",6,4);
-  if(reading.skinValid && !stale){ char sb[10]; snprintf(sb,10,"%.1fC",reading.skinC);   // skin temp small, by the name
-    tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(0xFE79); tft.setTextDatum(textdatum_t::top_left);
-    tft.drawString(sb,74,5); }
-  char hm[8]; bool haveTime=nowHM(hm);
-  tft.setFont(&fonts::FreeSans9pt7b); tft.setTextDatum(textdatum_t::top_right); char buf[40];
-  if(radioState == RadioState::RECEIVING){
-    tft.setTextColor(GREY);
-    snprintf(buf,sizeof(buf),"%s%s%s%d",
-             haveTime?hm:"",haveTime?"  ":"","sig",reading.signal);
-  } else {
-    tft.setTextColor(0xEB44);
-    const char* status = radioState == RadioState::STARTING
-                             ? "scan"
-                             : (radioState == RadioState::BAND_MISSING
-                                    ? "BAND / RANGE"
-                                    : "RADIO RETRY");
-    snprintf(buf,sizeof(buf),"%s%s%s",
-             haveTime?hm:"",haveTime?"  ":"",status);
-  }
-  tft.drawString(buf,W-6,5);
-}
-// mini 1-hour sparkline with warning reference lines
-void miniPlot(int x,int y,int w,int h,bool isHR){
-  uint8_t* data=isHR?hrHist:spHist;
-  float ymin=isHR?50:80, ymax=isHR?250:100;        // BPM clips 50..250 ; SpO2 80..100
-  float refYel=isHR?160:92, refRed=isHR?200:90;    // yellow/red warning lines
-  uint16_t col=isHR?0x6E6C:0x74FF;
-  tft.fillRect(x,y,w,h,BG);            // clear our own area, so the live view never full-screen wipes
-  tft.drawRect(x,y,w,h,LINE);
-  // TOP_PAD reserves a strip for the label. Without it a reading at the top of the scale (SpO2 100,
-  // HR 250) plots one pixel above the text and sits on top of "SpO2 1h".
-  const int TOP_PAD=11;
-  auto Y=[&](float v){ v=constrain(v,ymin,ymax);
-                       return y+h-2-(int)((v-ymin)/(ymax-ymin)*(h-3-TOP_PAD)); };
-  // NOTE: this panel renders TFT_YELLOW/TFT_RED swapped, so the constants are crossed on purpose:
-  tft.drawFastHLine(x+1,Y(refYel),w-2,TFT_RED);      // caution line -> shows YELLOW
-  tft.drawFastHLine(x+1,Y(refRed),w-2,TFT_YELLOW);   // danger line  -> shows RED
-  tft.setFont(&fonts::Font0); tft.setTextColor(GREY); tft.setTextDatum(textdatum_t::top_left);
-  tft.drawString(isHR?"BPM 1h":"SpO2 1h",x+3,y+2);
-  int n=histCnt;
-  if(n>=2){ int px=-1,py=-1;
-    for(int i=0;i<n;i++){ int idx=(histHead-n+i+HN)%HN; int v=data[idx];
-      int xx=x+1+(int)((long)i*(w-3)/(n-1)); int yy=Y(v);
-      if(px>=0) tft.drawLine(px,py,xx,yy,col); px=xx; py=yy; }
-  }
-}
-// Repaints only the regions whose values actually changed.
-//
-// This used to fillScreen() and redraw everything whenever the render key changed - which is on
-// every new measurement, about every 22 s (measured: 32 logged rows in 12 minutes). Wiping the
-// whole panel to change two numbers reads as a blink. Each region now clears its own rectangle
-// instead, and the full wipe happens only on a genuine full redraw: theme change, or returning
-// from another view.
-void drawLive(const ReadingSnapshot& reading,RadioState radioState,bool stale,uint8_t alertMask,
-              const LiveRenderKey& key,const LiveRenderKey& prev,bool full){
-  bool d=stale;
-  if(full){ tft.fillScreen(BG); tft.drawFastHLine(0,HDR-2,W,LINE); }
-
-  if(full || key.minuteKey!=prev.minuteKey || key.signal!=prev.signal ||
-     key.radioState!=prev.radioState || key.stale!=prev.stale ||
-     key.skinTenths!=prev.skinTenths || key.skinValid!=prev.skinValid){
-    drawHeader(reading,radioState,stale);       // already clears its own strip
-  }
-
-  char heartText[8];
-  char oxygenText[8];
-  const int shownHr = reading.effectiveHeartRate;
-  if(stale || shownHr == 0) strlcpy(heartText,"--",sizeof(heartText));
-  else snprintf(heartText,sizeof(heartText),"%d",shownHr);
-  if(stale || reading.oxygenSaturation == 0) strlcpy(oxygenText,"--",sizeof(oxygenText));
-  else snprintf(oxygenText,sizeof(oxygenText),"%d",reading.oxygenSaturation);
-  // top row: big current values
-  if(full || key.effectiveHeartRate!=prev.effectiveHeartRate || key.heartRate!=prev.heartRate ||
-     key.stale!=prev.stale || key.corrected!=prev.corrected ||
-     key.readingIssue!=prev.readingIssue || key.intervalHeartRate!=prev.intervalHeartRate){
-    // Orange for a corrected number, so a rate that came from the beat interval never looks like
-    // an ordinary reading, whether or not it happens to sit inside the safe band.
-    const uint16_t hrColour = d ? DIM
-                                : (key.corrected ? TFT_ORANGE
-                                   : ((shownHr&&(shownHr<HR_LOW||shownHr>HR_HIGH))?TFT_RED:0x6E6C));
-    cell(0,0,"HEART",heartText,"bpm",hrColour);
-    // Under the value: what the band said against what its own beat timing said. Either decode
-    // can lock onto every second beat, so whichever one is shown above, the other is worth seeing
-    // - and "reading issue" is reserved for an interval too wild to state as a rate.
-    if(key.corrected || key.readingIssue){
-      char note[24];
-      if(key.intervalHeartRate>0)
-        snprintf(note,sizeof(note),"band %d / beat %d",reading.heartRate,key.intervalHeartRate);
-      else strlcpy(note,"reading issue",sizeof(note));
-      tft.setFont(&fonts::Font0); tft.setTextSize(1);
-      tft.setTextColor(d?DIM:TFT_ORANGE);
-      tft.setTextDatum(textdatum_t::bottom_left);
-      tft.drawString(note,8,HDR+RH-4);
-    }
-  }
-  if(full || key.oxygenSaturation!=prev.oxygenSaturation || key.stale!=prev.stale)
-    cell(1,0,"OXYGEN",oxygenText,"%",d?DIM:((reading.oxygenSaturation&&reading.oxygenSaturation<SPO2_LOW)?TFT_RED:0x74FF));
-  // bottom row: 1-hour sparklines. Redrawn when the alert bar appears or clears too, because the
-  // bar overlaps their bottom rows and leaves a hole behind it otherwise.
-  int py=HDR+RH;
-  if(full || key.sequence!=prev.sequence || key.alertMask!=prev.alertMask){
-    miniPlot(2,      py+2, COLW-3, RH-4, true);   // BPM
-    miniPlot(COLW+1, py+2, COLW-3, RH-4, false);  // SpO2
-  }
-  char alertText[48] = "ALERT:";
-  if(alertMask & ALERT_HR_LOW) strlcat(alertText," HR LOW",sizeof(alertText));
-  if(alertMask & ALERT_HR_HIGH) strlcat(alertText," HR HIGH",sizeof(alertText));
-  if(alertMask & ALERT_SPO2_LOW) strlcat(alertText," SpO2 LOW",sizeof(alertText));
-  if(alertMask != ALERT_NONE){ int by=H-20; tft.fillRect(0,by,W,20,TFT_RED);
-    tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE);
-    tft.setTextDatum(textdatum_t::middle_center); tft.drawString(alertText,W/2,by+10); }
-}
-void renderLive(const ReadingSnapshot& reading,RadioState radioState){
-  uint32_t ageMs=static_cast<uint32_t>(millis()-reading.lastPacketMs);
-  bool stale=reading.lastPacketMs==0 || ageMs>STALE_MS;
-  uint8_t alertMask=makeAlertMask(reading.effectiveHeartRate,reading.oxygenSaturation,
-                                  stale,HR_LOW,HR_HIGH,SPO2_LOW);
-  LiveRenderKey key=makeLiveRenderKey(reading,radioState,stale,alertMask,minuteOfDay());
-  if(!g_renderKeyValid || key!=g_lastRenderKey){
-    drawLive(reading,radioState,stale,alertMask,key,g_lastRenderKey,!g_renderKeyValid);
-    g_lastRenderKey=key;
-    g_renderKeyValid=true;
-  }
-}
-
-// ---------- 24h plot ----------
-void drawPlot(){
-  int metric=plotMetric;                // 0=HR, 1=SpO2
-  int group=plotBinMin/15;              // 15-min units per plotted bin
-  int nb=96/group;
-  float ymin = metric?70:40, ymax = metric?100:200;
-  uint16_t col = metric?0x74FF:0x6E6C;
-  int PX0=34, PY0=30, PX1=W-6, PY1=H-24;
-  tft.fillScreen(BG);
-  // title (no Back button — auto-returns to the live view after 10 s of no touch)
-  tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(GREY); tft.setTextDatum(textdatum_t::top_center);
-  tft.drawString(String(metric?"OXYGEN":"HEART")+" 24h ("+plotBinMin+"m)", W/2, 5);
-  // axes frame
-  tft.drawRect(PX0,PY0,PX1-PX0,PY1-PY0,LINE);
-  // Y gridlines + labels
-  tft.setFont(&fonts::Font0); tft.setTextColor(DIM);
-  for(int k=0;k<=4;k++){ float v=ymin+(ymax-ymin)*k/4; int y=PY1-(int)((v-ymin)/(ymax-ymin)*(PY1-PY0));
-    tft.drawFastHLine(PX0,y,PX1-PX0,GRID); tft.setTextDatum(textdatum_t::middle_right); tft.drawString(String((int)v),PX0-2,y); }
-  // X gridlines + hour labels (0,6,12,18,24)
-  for(int hh=0;hh<=24;hh+=6){ int x=PX0+(int)((float)hh/24*(PX1-PX0));
-    tft.drawFastVLine(x,PY0,PY1-PY0,GRID); tft.setTextDatum(textdatum_t::top_center); tft.drawString(String(hh),x,PY1+2); }
-  // bars: avg +/- std as error bars
-  float bw=(float)(PX1-PX0)/nb;
-  for(int i=0;i<nb;i++){
-    uint32_t n=0; float s=0,sq=0;
-    for(int j=0;j<group;j++){ Bin& b=bins[i*group+j];
-      if(metric){ n+=b.nO; s+=b.sO; sq+=b.sqO; } else { n+=b.nH; s+=b.sH; sq+=b.sqH; } }
-    if(n==0) continue;
-    float avg=s/n; float var=sq/n-avg*avg; if(var<0)var=0; float sd=sqrtf(var);
-    int cx=PX0+(int)((i+0.5f)*bw);
-    auto Y=[&](float v){ v=constrain(v,ymin,ymax); return PY1-(int)((v-ymin)/(ymax-ymin)*(PY1-PY0)); };
-    int yl=Y(avg-sd), yh=Y(avg+sd), ya=Y(avg);
-    tft.drawFastVLine(cx,yh,yl-yh,col&0x7BEF);   // std band (dim)
-    tft.fillCircle(cx,ya,2,col);                 // avg dot
-  }
-  tft.setTextColor(DIM); tft.setTextDatum(textdatum_t::bottom_right);
-  tft.setFont(&fonts::Font0); tft.drawString("tap: change bin  -  auto-back 10s",W-4,H-2);
-}
-
-// Swap the chrome palette when the night window opens or closes, then repaint.
-// Value colours are untouched on purpose - the numbers keep the same hues day and night.
-void applyTheme(){
-  static int cur=-1; int n=isNight()?1:0;
-  if(n==cur) return; cur=n;
-  BG=n?INV(BG_D):BG_D;      GREY=n?INV(GREY_D):GREY_D;  DIM=n?INV(DIM_D):DIM_D;
-  LINE=n?INV(LINE_D):LINE_D; GRID=n?INV(GRID_D):GRID_D;
-  g_renderKeyValid=false;                         // invalidate the live-view redraw cache
-  tft.fillScreen(BG);
-  if(view==PLOT) drawPlot();
-}
-
-// ---------- touch ----------
-uint16_t xpt(uint8_t cmd){
-  digitalWrite(T_CS,LOW);
-  for(int i=7;i>=0;i--){ digitalWrite(T_MOSI,(cmd>>i)&1); digitalWrite(T_CLK,HIGH); digitalWrite(T_CLK,LOW); }
-  uint16_t v=0; digitalWrite(T_CLK,HIGH); digitalWrite(T_CLK,LOW);
-  for(int i=11;i>=0;i--){ digitalWrite(T_CLK,HIGH); v|=(digitalRead(T_MISO)<<i); digitalWrite(T_CLK,LOW); }
-  digitalWrite(T_CS,HIGH); return v;
-}
-bool touchXY(int& sx,int& sy){
-  uint16_t z=xpt(0xB0); if(z<250) return false;
-  uint32_t ax=0,ay=0; for(int i=0;i<5;i++){ ax+=xpt(0x90); ay+=xpt(0xD0);} ax/=5; ay/=5;
-  sx=constrain((int)map(ax,TOUCH_X0,TOUCH_X1,0,W),0,W-1);
-  sy=constrain((int)map(ay,TOUCH_Y0,TOUCH_Y1,0,H),0,H-1);
+// The theme and the backlight need the same two facts, the minute of the local day and that day's
+// night window, so they are read together and cannot disagree.
+bool localDayState(int& minuteOut, NightWindow& windowOut) {
+  time_t now;
+  time(&now);
+  struct tm local{};
+  localtime_r(&now, &local);
+  if (local.tm_year <= CLOCK_SET_MIN_TM_YEAR) return false;
+  minuteOut = local.tm_hour * 60 + local.tm_min;
+  windowOut = currentNightWindow(local, now);
   return true;
 }
 
-// ---------- data export: SoftAP + a tiny read-only HTTP server ----------
-WebServer* g_http=nullptr;
+// The dark theme cannot fade, so it flips in one step where the backlight starts fading down.
+// Without a valid clock the day look is the safe default.
+bool isNight() {
+  if (FORCE_NIGHT) return true;
+  if (!g_timeReady) return false;
+  int minute;
+  NightWindow window;
+  if (!localDayState(minute, window)) return false;
+  return isNightAt(minute, window);
+}
 
-// Whitelist, never a path mapping: /wifi.txt on the same card holds the HOME network password in
+// An unknown clock means full brightness, never a dark screen nobody asked for.
+int wantedBrightness() {
+  if (FORCE_NIGHT) return BRIGHT_NIGHT_LEVEL;
+  int minute;
+  NightWindow window;
+  if (!g_timeReady || !localDayState(minute, window)) return BRIGHT_DAY_LEVEL;
+  return brightnessAt(minute, window);
+}
+
+// The single owner of the backlight PWM; only writes on a change.
+void setBacklight(int level) {
+  static int current = -1;
+  if (level == current) return;
+  g_tft.setBrightness(level);
+  current = level;
+}
+
+void applyBrightness() { setBacklight(wantedBrightness()); }
+
+void drawCurrentPlot() { drawDayPlot(g_screen, g_dayBins, g_plotMetric, g_plotBinMinutes); }
+
+// Swaps the chrome palette when the night window opens or closes, then repaints.
+void applyTheme() {
+  static int current = -1;
+  const int night = isNight() ? 1 : 0;
+  if (night == current) return;
+  current = night;
+  g_screen.palette = paletteFor(night != 0);
+  g_renderKeyValid = false;
+  g_tft.fillScreen(g_screen.palette.bg);
+  if (g_view == View::PLOT) drawCurrentPlot();
+}
+
+// =================================================================================================
+// Touch: XPT2046, bit-banged
+// =================================================================================================
+
+void initTouchPins() {
+  pinMode(TOUCH_PIN_CLK, OUTPUT);
+  pinMode(TOUCH_PIN_MOSI, OUTPUT);
+  pinMode(TOUCH_PIN_CS, OUTPUT);
+  pinMode(TOUCH_PIN_MISO, INPUT);
+  pinMode(TOUCH_PIN_IRQ, INPUT);
+  digitalWrite(TOUCH_PIN_CS, HIGH);
+  digitalWrite(TOUCH_PIN_CLK, LOW);
+}
+
+// One 12-bit conversion. 0xB0 reads pressure, 0x90 the X axis, 0xD0 the Y axis.
+uint16_t touchCommand(uint8_t cmd) {
+  digitalWrite(TOUCH_PIN_CS, LOW);
+  for (int i = 7; i >= 0; --i) {
+    digitalWrite(TOUCH_PIN_MOSI, (cmd >> i) & 1);
+    digitalWrite(TOUCH_PIN_CLK, HIGH);
+    digitalWrite(TOUCH_PIN_CLK, LOW);
+  }
+  uint16_t value = 0;
+  digitalWrite(TOUCH_PIN_CLK, HIGH);   // busy cycle
+  digitalWrite(TOUCH_PIN_CLK, LOW);
+  for (int i = 11; i >= 0; --i) {
+    digitalWrite(TOUCH_PIN_CLK, HIGH);
+    value |= static_cast<uint16_t>(digitalRead(TOUCH_PIN_MISO) << i);
+    digitalWrite(TOUCH_PIN_CLK, LOW);
+  }
+  digitalWrite(TOUCH_PIN_CS, HIGH);
+  return value;
+}
+
+// Averaged screen coordinates of the current touch, or false when nothing is pressing.
+bool readTouch(int& x, int& y) {
+  if (touchCommand(0xB0) < TOUCH_PRESSURE_MIN) return false;
+  uint32_t sumX = 0;
+  uint32_t sumY = 0;
+  for (int i = 0; i < TOUCH_SAMPLES; ++i) {
+    sumX += touchCommand(0x90);
+    sumY += touchCommand(0xD0);
+  }
+  const Layout& L = g_screen.layout;
+  x = constrain(static_cast<int>(map(sumX / TOUCH_SAMPLES, TOUCH_CAL_X0, TOUCH_CAL_X1, 0, L.w)),
+                0, L.w - 1);
+  y = constrain(static_cast<int>(map(sumY / TOUCH_SAMPLES, TOUCH_CAL_Y0, TOUCH_CAL_Y1, 0, L.h)),
+                0, L.h - 1);
+  return true;
+}
+
+// =================================================================================================
+// Export mode: the board as an access point with a small read-only HTTP server
+// =================================================================================================
+
+WebServer* g_http = nullptr;
+
+// A whitelist, never a path mapping: /wifi.txt on the same card holds the home network password in
 // plain text, and this access point is reachable by anyone in the room while it is up.
-static bool exportAllowed(const String& p){
-  return p.startsWith("/vitals_") && p.endsWith(".csv") && p.indexOf("..")<0;
+bool exportAllowed(const String& path) {
+  return path.startsWith("/vitals_") && path.endsWith(".csv") && path.indexOf("..") < 0;
 }
-// Index of available days, so the page can offer a range without guessing filenames.
-static void handleDays(){
-  String j="["; File dir=SD.open("/");
-  if(dir){
-    for(File e=dir.openNextFile(); e; e=dir.openNextFile()){
-      String n=e.name(); if(!n.startsWith("/")) n="/"+n;
-      if(exportAllowed(n)){
-        if(j.length()>1) j+=",";
-        j+="{\"f\":\""+n+"\",\"n\":"+String((uint32_t)e.size())+"}";
+
+// JSON index of the available days, so the page can offer a range without guessing filenames.
+void handleDays() {
+  String json = "[";
+  File dir = SD.open("/");
+  if (dir) {
+    for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+      String name = entry.name();
+      if (!name.startsWith("/")) name = "/" + name;
+      if (exportAllowed(name)) {
+        if (json.length() > 1) json += ",";
+        json += "{\"f\":\"" + name + "\",\"n\":" + String(static_cast<uint32_t>(entry.size())) + "}";
       }
-      e.close();
+      entry.close();
     }
     dir.close();
   }
-  j+="]"; g_http->send(200,"application/json",j);
-}
-static void handleFile(){
-  String p=g_http->uri();
-  if(!exportAllowed(p)){ g_http->send(404,"text/plain","not found"); return; }
-  File f=SD.open(p);
-  if(!f){ g_http->send(404,"text/plain","not found"); return; }
-  g_http->streamFile(f,"text/csv"); f.close();
+  json += "]";
+  g_http->send(200, "application/json", json);
 }
 
-void drawExportStatic(){
-  tft.fillScreen(BG);
-  tft.setTextDatum(textdatum_t::top_center);
-  tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(GREY);
-  tft.drawString("DATA EXPORT",W/2,5);
-  tft.drawFastHLine(0,24,W,LINE);
-  struct Row { const char* label; const char* value; } rows[] = {
-    {"Wi-Fi network", AP_SSID},
-    {"Password",      AP_PASS},
-    {"Open in browser","http://192.168.4.1"},
-  };
-  int y=34;
-  for(auto& r : rows){
-    tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(DIM);
-    tft.setTextDatum(textdatum_t::top_center); tft.drawString(r.label,W/2,y);
-    tft.setFont(&fonts::FreeSansBold12pt7b); tft.setTextColor(GREY);
-    tft.drawString(r.value,W/2,y+15);
-    y+=52;
+void handleFile() {
+  const String path = g_http->uri();
+  if (!exportAllowed(path)) {
+    g_http->send(404, "text/plain", "not found");
+    return;
   }
-  // Monitoring really is off while this is up - say so in the same style as a vitals alert.
-  int by=H-42; tft.fillRect(0,by,W,20,TFT_RED);
-  tft.setFont(&fonts::FreeSansBold9pt7b); tft.setTextColor(TFT_WHITE);
-  tft.setTextDatum(textdatum_t::middle_center);
-  tft.drawString("MONITORING PAUSED",W/2,by+10);
-  tft.setFont(&fonts::FreeSans9pt7b); tft.setTextColor(DIM);
-  tft.setTextDatum(textdatum_t::top_center);
-  tft.drawString("swipe down to resume",W/2,by+24);
-}
-// Only the countdown changes, so redraw just that strip once a second.
-void drawExportCountdown(){
-  uint32_t left = (millis()-g_exportStart >= EXPORT_TIMEOUT_MS) ? 0
-                : (EXPORT_TIMEOUT_MS-(millis()-g_exportStart))/1000;
-  char b[56]; snprintf(b,56,"auto-resume in %lu:%02lu  (%d client%s)",
-                       (unsigned long)left/60,(unsigned long)left%60,
-                       WiFi.softAPgetStationNum(), WiFi.softAPgetStationNum()==1?"":"s");
-  tft.fillRect(0,H-16,W,16,BG);
-  tft.setFont(&fonts::Font0); tft.setTextColor(DIM);
-  tft.setTextDatum(textdatum_t::top_center); tft.drawString(b,W/2,H-13);
+  File file = SD.open(path);
+  if (!file) {
+    g_http->send(404, "text/plain", "not found");
+    return;
+  }
+  g_http->streamFile(file, "text/csv");
+  file.close();
 }
 
-void enterExport(){
-  view=EXPORT; g_exportStart=millis();
-  BLEDevice::deinit(true);                       // hand the radio over before WiFi starts
+uint32_t exportSecondsLeft() {
+  const uint32_t elapsed = millis() - g_exportStartMs;
+  return elapsed >= EXPORT_TIMEOUT_MS ? 0 : (EXPORT_TIMEOUT_MS - elapsed) / 1000;
+}
+
+void enterExport() {
+  markFirmwareHealthy();   // a deliberate reboot must not read as a failed update
+  g_view = View::EXPORT;
+  g_exportStartMs = millis();
+  BLEDevice::deinit(true);   // hand the radio over before WiFi starts
   WiFi.mode(WIFI_AP);
-  if(!WiFi.softAP(AP_SSID,AP_PASS)){             // no AP means no export: get back to monitoring
-    Serial.println("[export] softAP failed"); delay(200); ESP.restart();
+  if (!WiFi.softAP(AP_SSID, AP_PASS)) {   // no access point means no export: back to monitoring
+    Serial.println("[export] softAP failed");
+    delay(200);
+    ESP.restart();
   }
-  g_http=new WebServer(80);
-  g_http->on("/",[](){ g_http->send_P(200,"text/html",APP_HTML); });
-  g_http->on("/days",handleDays);
+  g_http = new WebServer(80);
+  g_http->on("/", []() { g_http->send_P(200, "text/html", APP_HTML); });
+  g_http->on("/days", handleDays);
   g_http->onNotFound(handleFile);
   g_http->begin();
-  setBacklight(BRIGHT_DAY_LEVEL);                // the credentials have to be readable at night too
-  drawExportStatic(); drawExportCountdown();
-  Serial.printf("[export] AP=%s ip=%s\n",AP_SSID,WiFi.softAPIP().toString().c_str());
+  setBacklight(BRIGHT_ALARM_LEVEL);   // the credentials have to be readable at night too
+  drawExportStatic(g_screen);
+  drawExportCountdown(g_screen, exportSecondsLeft(), WiFi.softAPgetStationNum());
+  Serial.printf("[export] AP=%s ip=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
+
 // Reboot rather than tear down: restarting is the one reliable way back to a full-speed BLE radio
-// after WiFi has run (same reason setup() reboots after its NTP sync). Clock and history survive.
-void exitExport(){
+// after WiFi has run, for the same reason setup() reboots after its NTP sync. Clock and history
+// survive.
+void exitExport() {
   Serial.println("[export] resuming monitoring");
-  if(g_http){ g_http->stop(); }
-  WiFi.softAPdisconnect(true); WiFi.mode(WIFI_OFF);
-  delay(150); ESP.restart();
+  if (g_http) g_http->stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+  ESP.restart();
 }
 
-// Gestures resolve on lift-off, not on contact: a swipe begins as a touch, so acting on the first
-// sample would fire the tap action at the start of every swipe.
-// Returns 0 none, 1 tap (position in tx,ty), 2 swipe up, 3 swipe down.
-bool g_touching=false;
-// The one touch sample taken per loop pass. readGesture resolves taps and swipes on lift-off;
-// the three-second hold needs the same raw sample while the finger is still down, and sampling
-// the panel twice a pass to get it would be pure waste.
-bool g_touchDown=false; int g_touchX=0, g_touchY=0;
-int readGesture(int& tx,int& ty){
-  static int x0,y0,x1,y1; static uint32_t t0=0;
-  int sx,sy; bool now=touchXY(sx,sy);
-  g_touchDown=now; if(now){ g_touchX=sx; g_touchY=sy; }
-  if(now){
-    if(!g_touching){ g_touching=true; x0=x1=sx; y0=y1=sy; t0=millis(); }
-    else { x1=sx; y1=sy; }
-    return 0;
+// Export mode owns the loop: no BLE, no live view, just the page until told to stop.
+void serviceExport(Gesture gesture) {
+  g_http->handleClient();
+  if (gesture == Gesture::SWIPE_DOWN || millis() - g_exportStartMs > EXPORT_TIMEOUT_MS) {
+    exitExport();   // reboots, never returns
   }
-  if(!g_touching) return 0;
-  g_touching=false;
-  int dx=x1-x0, dy=y1-y0;
-  if(abs(dy)>=SWIPE_MIN_DY && abs(dy)>abs(dx)) return dy<0 ? 2 : 3;
-  if(abs(dx)<=TAP_MAX_MOVE && abs(dy)<=TAP_MAX_MOVE && millis()-t0<600){ tx=x0; ty=y0; return 1; }
-  return 0;                                      // too short for a swipe, too smeared for a tap
+  static uint32_t lastCountdownMs = 0;
+  if (millis() - lastCountdownMs > EXPORT_COUNTDOWN_REFRESH_MS) {
+    lastCountdownMs = millis();
+    drawExportCountdown(g_screen, exportSecondsLeft(), WiFi.softAPgetStationNum());
+  }
+  delay(5);   // keep the server responsive
 }
 
-void bootMsg(const char* s){ tft.fillScreen(BG); tft.setFont(&fonts::FreeSans9pt7b);
-  tft.setTextColor(GREY); tft.setTextDatum(textdatum_t::middle_center); tft.drawString(s,tft.width()/2,tft.height()/2); }
+// =================================================================================================
+// Maintenance mode: the board on the home network, accepting a firmware upload (ArduinoOTA)
+// =================================================================================================
 
-void setup(){
-  Serial.begin(115200); delay(300);
-  // Latch the true cause before the NTP soft-reboot can overwrite it with ESP_RST_SW (see g_origReason).
-  { esp_reset_reason_t rr=esp_reset_reason(); if(rr!=ESP_RST_SW) g_origReason=rr; }
-  pinMode(T_CLK,OUTPUT); pinMode(T_MOSI,OUTPUT); pinMode(T_CS,OUTPUT);
-  pinMode(T_MISO,INPUT); pinMode(T_IRQ,INPUT); digitalWrite(T_CS,HIGH); digitalWrite(T_CLK,LOW);
-  tft.init();
-  for(int r=0;r<4;r++){ tft.setRotation(r); tft.fillScreen(BG); }
-  tft.setRotation(ROTATION); tft.setBrightness(BRIGHT_DAY_LEVEL);   // daytime level until the clock is known
-  W=tft.width(); H=tft.height(); HDR=28; COLW=W/2; RH=(H-HDR)/2;
-  setenv("TZ",TZ_INFO,1); tzset();   // re-apply TZ each boot (survives via env, not the reboot)
-  bootMsg("SD card..."); initSD();
-  // Clock: WiFi coexistence badly throttles BLE, and a deinit can't fully undo it. So on a COLD
-  // boot we sync NTP once, then SOFT-REBOOT into BLE-only mode (the RTC clock survives the
-  // reboot). On the second boot the time is already set, WiFi is skipped, and BLE runs full speed.
-  struct tm tmc{};
-  bool haveTime = readLocalClock(tmc);
-  if (!haveTime && !g_syncedThisPower) {
-    bootMsg("WiFi clock sync (one-time)...");
-    bool synced = syncTimeOverWifi();
-    if (synced && readLocalClock(tmc)) {
-      g_syncedThisPower = true;                     // survives the soft reboot (RTC memory)
-      bootMsg("clock set - rebooting for BLE...");
+const char* otaErrorName(ota_error_t error) {
+  switch (error) {
+    case OTA_AUTH_ERROR: return "wrong password";
+    case OTA_BEGIN_ERROR: return "could not start";
+    case OTA_CONNECT_ERROR: return "connection failed";
+    case OTA_RECEIVE_ERROR: return "transfer failed";
+    case OTA_END_ERROR: return "image rejected";
+  }
+  return "unknown error";
+}
+
+MaintenanceStatus maintenanceStatus(MaintenancePhase phase) {
+  MaintenanceStatus st{};
+  st.phase = phase;
+  if (WiFi.status() == WL_CONNECTED) {
+    strlcpy(st.network, WiFi.SSID().c_str(), sizeof(st.network));
+    strlcpy(st.address, WiFi.localIP().toString().c_str(), sizeof(st.address));
+  }
+  st.hostname = OTA_HOSTNAME;
+  return st;
+}
+
+uint32_t maintenanceSecondsLeft() {
+  const uint32_t elapsed = millis() - g_maintenanceStartMs;
+  return elapsed >= OTA_MODE_TIMEOUT_MS ? 0 : (OTA_MODE_TIMEOUT_MS - elapsed) / 1000;
+}
+
+// Reboot rather than tear down, for the same reason as export mode.
+void exitMaintenance() {
+  Serial.println("[ota] resuming monitoring");
+  ArduinoOTA.end();
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+  ESP.restart();
+}
+
+// Same shape as enterExport(): Bluetooth is handed over to WiFi without a reboot, and leaving
+// reboots. The difference is that the board joins the home network as a station instead of
+// becoming an access point, so a computer on that network can push a build with espota.
+void enterMaintenance() {
+  markFirmwareHealthy();   // a deliberate reboot must not read as a failed update
+  g_view = View::MAINTENANCE;
+  g_maintenanceStartMs = millis();
+  g_otaUploading = false;
+  setBacklight(BRIGHT_ALARM_LEVEL);
+  drawMaintenanceStatic(g_screen, maintenanceStatus(MaintenancePhase::CONNECTING));
+
+  BLEDevice::deinit(true);   // hand the radio over before WiFi starts
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(OTA_HOSTNAME);
+  WiFi.setSleep(false);   // responsiveness over power for these ten minutes
+  const bool connected = runWifiFailover([](WifiSlot slot) { return connectWifiSlot(slot); });
+  if (!connected) {
+    Serial.println("[ota] no network reachable");
+    drawMaintenanceStatic(g_screen, maintenanceStatus(MaintenancePhase::NO_NETWORK));
+    delay(4000);
+    exitMaintenance();   // reboots, never returns
+  }
+
+  char password[OTA_PASSWORD_MAX];
+  const bool havePassword = loadOtaPassword(password, sizeof(password));
+  if (havePassword) {
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPort(OTA_PORT);
+    ArduinoOTA.setPassword(password);   // kept as a hash inside ArduinoOTA
+    memset(password, 0, sizeof(password));
+    ArduinoOTA.onStart([]() {
+      g_otaUploading = true;
+      Serial.println("[ota] upload started");
+      drawMaintenanceProgress(g_screen, 0, 1);
+    });
+    ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+      drawMaintenanceProgress(g_screen, done, total);
+    });
+    ArduinoOTA.onEnd([]() {   // ArduinoOTA reboots after this returns
+      Serial.println("[ota] upload complete, rebooting into the new firmware");
+      drawMaintenanceMessage(g_screen, "Update installed", "rebooting...");
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+      Serial.printf("[ota] failed: %s\n", otaErrorName(error));
+      drawMaintenanceMessage(g_screen, "Update failed", otaErrorName(error));
+      delay(4000);
+      exitMaintenance();   // reboots into the firmware that was already running
+    });
+    ArduinoOTA.begin();
+  } else {
+    Serial.println("[ota] no /ota.txt on the card: upload disabled");
+  }
+
+  drawMaintenanceStatic(g_screen, maintenanceStatus(havePassword ? MaintenancePhase::READY
+                                                                 : MaintenancePhase::NO_PASSWORD));
+  drawMaintenanceCountdown(g_screen, maintenanceSecondsLeft());
+  Serial.printf("[ota] %s host=%s ip=%s\n", havePassword ? "ready" : "disabled", OTA_HOSTNAME,
+                WiFi.localIP().toString().c_str());
+}
+
+// Maintenance mode owns the loop. Once a transfer starts, handle() blocks until it ends and the
+// callbacks above draw the progress, so the swipe and the timeout only apply between transfers.
+void serviceMaintenance(Gesture gesture) {
+  ArduinoOTA.handle();
+  if (g_otaUploading) return;
+  if (gesture == Gesture::SWIPE_DOWN || millis() - g_maintenanceStartMs > OTA_MODE_TIMEOUT_MS) {
+    exitMaintenance();   // reboots, never returns
+  }
+  static uint32_t lastCountdownMs = 0;
+  if (millis() - lastCountdownMs > OTA_COUNTDOWN_REFRESH_MS) {
+    lastCountdownMs = millis();
+    drawMaintenanceCountdown(g_screen, maintenanceSecondsLeft());
+  }
+  delay(5);
+}
+
+// =================================================================================================
+// Views
+// =================================================================================================
+
+void showBootMessage(const char* text) {
+  g_tft.fillScreen(g_screen.palette.bg);
+  g_tft.setFont(&fonts::FreeSans9pt7b);
+  g_tft.setTextColor(g_screen.palette.grey);
+  g_tft.setTextDatum(textdatum_t::middle_center);
+  g_tft.drawString(text, g_tft.width() / 2, g_tft.height() / 2);
+}
+
+void showLiveView() {
+  g_view = View::LIVE;
+  g_renderKeyValid = false;
+  g_tft.fillScreen(g_screen.palette.bg);
+}
+
+void renderLive(const ReadingSnapshot& reading, RadioState radioState, bool stale) {
+  const uint8_t alertMask = makeAlertMask(reading.effectiveHeartRate, reading.oxygenSaturation,
+                                          stale, HR_LOW, HR_HIGH, SPO2_LOW);
+  const LiveRenderKey key =
+      makeLiveRenderKey(reading, radioState, stale, alertMask, minuteOfDay());
+  if (g_renderKeyValid && key == g_lastRenderKey) return;
+  char clock[8];
+  clockText(clock, sizeof(clock));
+  drawLive(g_screen, g_history, reading, radioState, clock, key, g_lastRenderKey,
+           !g_renderKeyValid);
+  g_lastRenderKey = key;
+  g_renderKeyValid = true;
+}
+
+// A tap on a column of the live view opens its 24-hour chart; a tap on the chart cycles the bin width.
+void handleTap(int x, int y) {
+  g_lastTouchMs = millis();
+  if (g_view == View::LIVE) {
+    if (y < g_screen.layout.headerH) return;
+    g_plotMetric = x < g_screen.layout.colW ? DayMetric::HEART_RATE : DayMetric::OXYGEN;
+    g_view = View::PLOT;
+    drawCurrentPlot();
+  } else if (g_view == View::PLOT) {
+    g_plotBinMinutes = g_plotBinMinutes == 60 ? 30 : (g_plotBinMinutes == 30 ? 15 : 60);
+    drawCurrentPlot();
+  }
+}
+
+// ---- alarm view ---------------------------------------------------------------------------------
+
+AlarmRenderKey g_alarmKey;
+bool g_alarmKeyValid = false;
+
+// Entering the alarm: the screen is taken over, brightness forced up regardless of night mode, and
+// the onset is on the card before anything else can go wrong.
+void onAlarmStarted(const ReadingSnapshot& r) {
+  g_selfTest = false;   // a real alarm during a self-test must not be labelled TEST
+  g_view = View::ALARM;
+  setBacklight(BRIGHT_ALARM_LEVEL);
+  g_renderKeyValid = false;
+  g_alarmKeyValid = false;
+
+  const AlarmMachine* m = firingAlarm();
+  const AlarmCause cause = m ? m->cause : AlarmCause::NONE;
+  // The rate the firing machine acted on: the fast alarm may have heard the beat interval while the
+  // screen kept the byte, and the log has to say which number raised it.
+  const int acted = (m == &g_alarmHigh) ? r.highAlarmHeartRate : r.effectiveHeartRate;
+  // The cause name stays the first token of the detail column: reconcileAlertLine() matches on it.
+  char detail[48];
+  if (acted != r.heartRate) {
+    snprintf(detail, sizeof(detail), "%s band=%d beat=%dms", alarmCauseName(cause), r.heartRate,
+             r.beatMs);
+  } else {
+    snprintf(detail, sizeof(detail), "%s", alarmCauseName(cause));
+  }
+  logAlert("ONSET", acted, r.oxygenSaturation, detail);
+  Serial.printf("[alarm] %s hr=%d band=%d beat=%d\n", alarmCauseName(cause), acted, r.heartRate,
+                r.beatMs);
+}
+
+void leaveAlarmView() {
+  g_selfTest = false;
+  g_view = View::LIVE;
+  applyBrightness();
+  applyTheme();
+  g_renderKeyValid = false;
+  g_alarmKeyValid = false;
+  g_tft.fillScreen(g_screen.palette.bg);
+}
+
+void startSelfTest() {
+  g_selfTest = true;
+  g_selfTestStartMs = millis();
+  setBacklight(BRIGHT_ALARM_LEVEL);
+  g_alarmKeyValid = false;
+  Serial.println("[alarm] self-test");
+}
+
+// The alarm owns the screen but not the radio: unlike export mode, BLE keeps running underneath, so
+// the trace and the numbers stay live while the alarm is up.
+void serviceAlarmView(const ReadingSnapshot& reading, RadioState radioState, bool stale) {
+  const uint32_t now = millis();
+  const HoldResult hold =
+      holdUpdate(g_hold, g_touchDown, g_touchX, g_touchY, now, HOLD_COUNTDOWN_MS, TAP_MAX_MOVE);
+
+  if (hold.completed) {
+    if (!g_selfTest) {
+      logAlert("DISMISS", reading.effectiveHeartRate, reading.oxygenSaturation, "dismissed");
+      // Both, always. One hold silences the screen, so it has to snooze the other side too;
+      // otherwise dismissing a slow alarm can be followed a second later by a fast one from the
+      // same run of doubtful readings.
+      alarmDismiss(g_alarmHigh, now);
+      alarmDismiss(g_alarmLow, now);
+    }
+    leaveAlarmView();
+    return;
+  }
+  if (g_selfTest && static_cast<uint32_t>(now - g_selfTestStartMs) >= SELFTEST_DURATION_S * 1000UL) {
+    leaveAlarmView();
+    return;
+  }
+
+  const uint32_t nowEpoch = nowEpochOrZero();
+  AlarmMachine* firing = firingAlarm();
+  AlarmAppearance a;
+  a.machine = firing ? firing : &g_alarmHigh;   // the self-test borrows the fast machine's idle state
+  a.contacts = &g_contacts;
+  // The number on the alarm screen is the one the firing machine acted on.
+  a.heartRate = (firing == &g_alarmHigh) ? reading.highAlarmHeartRate : reading.effectiveHeartRate;
+  a.rawHeartRate = reading.heartRate;
+  a.corrected = a.heartRate != reading.heartRate;
+  a.oxygen = reading.oxygenSaturation;
+  a.oxygenAgeMin = (g_spo2StampEpoch && nowEpoch >= g_spo2StampEpoch)
+                       ? static_cast<int>((nowEpoch - g_spo2StampEpoch) / 60)
+                       : -1;
+  a.elapsedS = g_selfTest ? 0 : alarmElapsedS(*a.machine, nowEpoch);
+  a.selfTest = g_selfTest;
+  a.selfTestLeftS = static_cast<int>(SELFTEST_DURATION_S - (now - g_selfTestStartMs) / 1000);
+  a.stale = stale;
+  a.radioState = radioState;
+
+  // Three independent repaints, so the fastest-changing thing does not drag the slowest through a
+  // redraw: the vitals and trace when a reading lands (~20 s), the timer once a second in its own
+  // corner, the frame twice a second as four thin rectangles.
+  const AlarmRenderKey key{reading.sequence,   reading.effectiveHeartRate, reading.heartRate,
+                           reading.highAlarmHeartRate, reading.oxygenSaturation, stale, radioState};
+  if (!g_alarmKeyValid || !(key == g_alarmKey)) {
+    g_alarmKey = key;
+    g_alarmKeyValid = true;
+    drawAlarmStatic(g_screen, g_history, a);
+    drawAlarmTimer(g_screen, a);
+    drawAlarmHold(g_screen, hold, g_selfTest);
+    // Evidence for "the trace looks frozen": one line per repaint, so the spacing between lines is
+    // the real reading cadence and `timed` says whether the trace has a time axis.
+    Serial.printf("[alarm] draw hr=%d spo2=%d seq=%d hist=%d timed=%d age=%lus\n",
+                  reading.effectiveHeartRate, reading.oxygenSaturation, reading.sequence,
+                  g_history.count, tracePositional(g_history.epoch, g_history.count) ? 0 : 1,
+                  static_cast<unsigned long>(
+                      reading.lastPacketMs ? (now - reading.lastPacketMs) / 1000 : 0));
+  }
+
+  static uint32_t lastTimerS = 0xFFFFFFFF;
+  const uint32_t shownS = g_selfTest ? static_cast<uint32_t>(a.selfTestLeftS) : a.elapsedS;
+  if (shownS != lastTimerS) {
+    lastTimerS = shownS;
+    drawAlarmTimer(g_screen, a);
+  }
+
+  static bool lastFrameOn = false;
+  static bool lastHoldActive = false;
+  static uint8_t lastHoldPercent = 255;
+  const bool frameOn = (now / ALARM_FLASH_MS) % 2 == 0;
+  if (frameOn != lastFrameOn) {
+    lastFrameOn = frameOn;
+    drawAlarmFrame(g_screen, frameOn);
+  }
+  if (hold.active != lastHoldActive || hold.percent != lastHoldPercent) {
+    lastHoldActive = hold.active;
+    lastHoldPercent = hold.percent;
+    drawAlarmHold(g_screen, hold, g_selfTest);
+  }
+}
+
+// Holding the HEART cell runs the alarm self-check. This resolves while still touching, unlike a
+// tap, because the countdown has to be drawn during the hold; a completed hold then suppresses the
+// release so testing the alarm does not also open the 24-hour chart.
+HeartHold serviceHeartHold(GestureResult& gesture) {
+  // Guarded against g_selfTest: during a self-test the view is still LIVE, and without this both
+  // this function and serviceAlarmView() would drive the same HoldState in one pass.
+  if (g_view != View::LIVE || g_selfTest) return HeartHold::NONE;
+  const Layout& L = g_screen.layout;
+  const bool onHeart = g_touchDown && g_touchY >= L.headerH && g_touchX < L.colW;
+  const HoldResult h = holdUpdate(g_hold, onHeart, g_touchX, g_touchY, millis(),
+                                  HOLD_COUNTDOWN_MS, TAP_MAX_MOVE);
+  if (h.completed) {
+    startSelfTest();
+    return HeartHold::COMPLETED;
+  }
+  static bool wasHolding = false;
+  if (h.active) {
+    // The same countdown the alarm screen shows, over the heart cell.
+    char seconds[8];
+    snprintf(seconds, sizeof(seconds), "%u", static_cast<unsigned>(h.secondsLeft));
+    g_tft.setFont(&fonts::FreeSansBold9pt7b);
+    g_tft.setTextColor(PANEL_RED, g_screen.palette.bg);   // opaque, so 3 -> 2 -> 1 overwrites cleanly
+    g_tft.setTextDatum(textdatum_t::middle_center);
+    g_tft.drawString(seconds, L.colW / 2, L.headerH + L.rowH / 2);
+    wasHolding = true;
+    return HeartHold::COUNTING;
+  }
+  if (wasHolding) {   // abandoned: repaint the live view over the digit
+    wasHolding = false;
+    g_renderKeyValid = false;
+  }
+  if (gesture.gesture == Gesture::TAP && holdConsumedTap(g_hold)) gesture.gesture = Gesture::NONE;
+  return HeartHold::NONE;
+}
+
+// =================================================================================================
+// Alarms
+// =================================================================================================
+
+// Driven every pass before rendering, so the alarm can take the screen in the same pass it fires.
+void serviceAlarms(const ReadingSnapshot& reading, bool stale) {
+  const uint32_t now = millis();
+  static int lastSequence = -1;
+  if (reading.sequence != lastSequence && readingIsFresh(reading, now)) {
+    lastSequence = reading.sequence;
+    const uint32_t nowEpoch = nowEpochOrZero();
+    if (reading.oxygenSaturation > 0) g_spo2StampEpoch = nowEpoch;
+    // The slow alarm hears the displayed rate. The fast alarm hears the faster decode whenever the
+    // band contradicts itself (band_protocol.h): a doubled interval must never pose as bradycardia,
+    // and a tachycardia whose byte arrives halved must still be counted.
+    const bool highCorrected = reading.highAlarmHeartRate != reading.heartRate;
+    const AlarmEvent high = alarmOnReading(g_alarmHigh, ALARM_HIGH_CFG, reading.highAlarmHeartRate,
+                                           now, nowEpoch, highCorrected);
+    const AlarmEvent low = alarmOnReading(g_alarmLow, ALARM_LOW_CFG, reading.effectiveHeartRate,
+                                          now, nowEpoch, reading.heartRateCorrected);
+    if (high.alarmStarted || low.alarmStarted) onAlarmStarted(reading);
+    if (high.episodeResolved) {
+      logAlert("RESOLVED", reading.highAlarmHeartRate, reading.oxygenSaturation, "");
+    }
+    if (low.episodeResolved) {
+      logAlert("RESOLVED", reading.effectiveHeartRate, reading.oxygenSaturation, "");
+    }
+  }
+  const AlarmEvent high = alarmTick(g_alarmHigh, ALARM_HIGH_CFG, now, stale);
+  const AlarmEvent low = alarmTick(g_alarmLow, ALARM_LOW_CFG, now, stale);
+  if (high.alarmStarted || low.alarmStarted) onAlarmStarted(reading);
+}
+
+// Each new measurement goes to the daily log, the 24-hour bins and the one-hour history.
+void recordNewReading(const ReadingSnapshot& reading) {
+  static int lastLogged = -1;
+  if (reading.sequence == lastLogged || !readingIsFresh(reading, millis())) return;
+  lastLogged = reading.sequence;
+  logVitalsRow(reading);
+  const int minute = minuteOfDay();
+  if (minute >= 0) {
+    dayBinsAdd(g_dayBins, reading.effectiveHeartRate, reading.oxygenSaturation, minute);
+  }
+  historyPush(g_history, reading.effectiveHeartRate, reading.oxygenSaturation, nowEpochOrZero());
+}
+
+// Skipped while the alarm is up: the alarm forces full brightness regardless of the hour, and
+// letting the schedule dim it back down would be the worst bug this feature could have.
+void serviceBacklight() {
+  static uint32_t lastMs = 0;
+  if (g_view == View::ALARM || g_selfTest) return;
+  if (millis() - lastMs <= BACKLIGHT_REFRESH_MS) return;
+  lastMs = millis();
+  applyBrightness();
+  applyTheme();
+}
+
+// A freshly installed firmware boots on probation (firmware_health.h). It is confirmed once the
+// scan is running and the loop has survived its first minute; a crash before then rolls back.
+void serviceFirmwareHealth() {
+  static bool done = false;
+  if (done) return;
+  if (millis() < OTA_HEALTHY_AFTER_MS) return;
+  if (!readRadioRuntime().scanStarted) return;
+  markFirmwareHealthy();
+  done = true;
+}
+
+// =================================================================================================
+// setup / loop
+// =================================================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  // Latch the true reset cause before the NTP soft reboot can overwrite it with ESP_RST_SW.
+  {
+    const esp_reset_reason_t reason = esp_reset_reason();
+    if (reason != ESP_RST_SW) g_originalResetReason = reason;
+  }
+
+  initTouchPins();
+  g_tft.init();
+  for (int r = 0; r < 4; ++r) {   // clear the whole panel memory, whichever way it is mapped
+    g_tft.setRotation(r);
+    g_tft.fillScreen(g_screen.palette.bg);
+  }
+  g_tft.setRotation(DISPLAY_ROTATION);
+  g_tft.setBrightness(BRIGHT_DAY_LEVEL);   // daytime level until the clock is known
+  g_screen.layout = layoutFor(g_tft.width(), g_tft.height());
+  setenv("TZ", TZ_INFO, 1);   // re-applied each boot: the environment does not survive a reboot
+  tzset();
+
+  showBootMessage("SD card...");
+  initSd();
+
+  // WiFi coexistence throttles BLE badly and a deinit cannot fully undo it. So a cold boot syncs NTP
+  // once and soft-reboots into BLE-only mode; the RTC clock survives, so the second boot skips WiFi
+  // and BLE runs at full speed.
+  struct tm now{};
+  if (!readLocalClock(now) && !g_syncedThisPower) {
+    showBootMessage("WiFi clock sync (one-time)...");
+    if (syncTimeOverWifi() && readLocalClock(now)) {
+      g_syncedThisPower = true;
+      showBootMessage("clock set - rebooting for BLE...");
       delay(250);
       ESP.restart();
     }
   }
-  g_timeReady = readLocalClock(tmc);
-  logBoot();                                      // evidence for tomorrow morning: why did it restart?
-  applyBrightness(); applyTheme();
-  bootMsg("Loading history..."); loadCsvToday();
-  loadContacts(); reconcileOpenEpisode();
-  if(firingAlarm()!=nullptr){ view=ALARM; setBacklight(255); }
-  bootMsg("Bluetooth...");
-  BLEDevice::init(""); g_bleScanner=BLEDevice::getScan();
-  g_bleScanner->setAdvertisedDeviceCallbacks(new CB(),true);
-  // Passive: never transmit a scan request. Required by the receive-only rule at the top of this
-  // file, and it also saves the TX bursts. Everything we decode is in the advertisement itself.
+  g_timeReady = readLocalClock(now);
+  logBoot();
+  applyBrightness();
+  applyTheme();
+
+  showBootMessage("Loading history...");
+  loadTodayFromCsv();
+  loadContacts();
+  reconcileOpenEpisode();
+  if (firingAlarm() != nullptr) {
+    g_view = View::ALARM;
+    setBacklight(BRIGHT_ALARM_LEVEL);
+  }
+
+  showBootMessage("Bluetooth...");
+  BLEDevice::init("");
+  g_bleScanner = BLEDevice::getScan();
+  g_bleScanner->setAdvertisedDeviceCallbacks(new BandScanCallbacks(), true);
   startBleScan(millis());
-  tft.fillScreen(BG);
-  Serial.printf("[ready] sd=%d time=%d\n",g_sdReady,g_timeReady);
+  g_tft.fillScreen(g_screen.palette.bg);
+  Serial.printf("[ready] sd=%d time=%d\n", g_sdReady, g_timeReady);
 }
 
-// Entering the alarm: the screen is taken over and brightness forced up regardless of night mode,
-// and the onset is on the card before anything else can go wrong.
-void onAlarmStarted(const ReadingSnapshot& r){
-  g_selfTest=false;                 // a real alarm during a self-test must not be labelled TEST
-  view=ALARM; setBacklight(255); g_renderKeyValid=false; g_alarmKeyValid=false;
-  const AlarmMachine* m=firingAlarm();
-  const AlarmCause cause = m ? m->cause : AlarmCause::NONE;
-  // The rate the firing machine acted on: the high alarm may have heard the beat interval while
-  // the screen kept the byte, and the log has to say which number raised it.
-  const int acted = (m==&g_alarm) ? r.highAlarmHeartRate : r.effectiveHeartRate;
-  // The cause name stays the first token of the detail column: reconcileAlertLine() matches on it.
-  char detail[48];
-  if(acted!=r.heartRate)
-    snprintf(detail,sizeof(detail),"%s band=%d beat=%dms",alarmCauseName(cause),
-             r.heartRate,r.beatMs);
-  else
-    snprintf(detail,sizeof(detail),"%s",alarmCauseName(cause));
-  logAlert("ONSET",acted,r.oxygenSaturation,detail);
-  Serial.printf("[alarm] %s hr=%d band=%d beat=%d\n",alarmCauseName(cause),
-                acted,r.heartRate,r.beatMs);
-}
+void loop() {
+  const uint32_t now = millis();
 
-void leaveAlarmView(){
-  g_selfTest=false; view=LIVE; applyBrightness(); applyTheme();
-  g_renderKeyValid=false; g_alarmKeyValid=false; tft.fillScreen(BG);
-}
+  // One touch sample per pass, taken even while the alarm owns the screen so the hold countdown
+  // stays fresh. Gesture actions are suppressed while it does; see the view guards below.
+  g_touchDown = readTouch(g_touchX, g_touchY);
+  GestureResult gesture = gestureUpdate(g_gesture, g_touchDown, g_touchX, g_touchY, now,
+                                        SWIPE_MIN_DY, TAP_MAX_MOVE, TAP_MAX_MS);
 
-// The alarm owns the screen but not the radio: unlike export mode, BLE keeps running underneath,
-// so the trace and the numbers stay live while the alarm is up.
-void serviceAlarmView(const ReadingSnapshot& reading,RadioState radioState,bool stale){
-  const HoldResult hold=holdUpdate(g_hold,g_touchDown,g_touchX,g_touchY,millis(),
-                                   HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
-
-  if(hold.completed){
-    if(!g_selfTest){
-      logAlert("DISMISS",reading.effectiveHeartRate,reading.oxygenSaturation,"dismissed");
-      // Both, always. One hold silences the screen, so it has to silence what put it there and
-      // snooze the other side too - otherwise dismissing a low alarm can be followed a second
-      // later by a high one from the same run of doubtful readings.
-      alarmDismiss(g_alarm,millis());
-      alarmDismiss(g_alarmLow,millis());
-    }
-    leaveAlarmView(); return;
-  }
-  if(g_selfTest && static_cast<uint32_t>(millis()-g_selfTestStart)>=SELFTEST_DURATION_S*1000UL){
-    leaveAlarmView(); return;
-  }
-
-  const uint32_t nowE=nowEpochOrZero();
-  AlarmAppearance a;
-  AlarmMachine* firing=firingAlarm();
-  a.machine = firing ? firing : &g_alarm;    // self-test borrows the high machine's empty state
-  a.contacts=&g_contacts;
-  // The number on the alarm screen is the one the firing machine acted on, which for the high
-  // alarm can be the beat interval's rate while the live view kept the byte.
-  a.heartRate = (firing==&g_alarm) ? reading.highAlarmHeartRate : reading.effectiveHeartRate;
-  a.rawHeartRate=reading.heartRate;
-  a.corrected = a.heartRate!=reading.heartRate; a.oxygen=reading.oxygenSaturation;
-  a.oxygenAgeMin = (g_spo2StampEpoch && nowE>=g_spo2StampEpoch)
-                     ? static_cast<int>((nowE-g_spo2StampEpoch)/60) : -1;
-  a.elapsedS = g_selfTest ? 0 : alarmElapsedS(*a.machine,nowE);
-  a.selfTest=g_selfTest;
-  a.selfTestLeftS=static_cast<int>(SELFTEST_DURATION_S-(millis()-g_selfTestStart)/1000);
-  a.stale=stale; a.radioState=radioState;
-
-  // Three independent repaints, so the fastest-changing thing does not drag the slowest through
-  // a redraw: the vitals and trace only when a new reading lands (~20 s), the timer once a
-  // second in its own corner, the frame twice a second as six thin rectangles.
-  const int key = reading.sequence*7 + reading.effectiveHeartRate + reading.heartRate*11
-                  + reading.highAlarmHeartRate*13 + reading.oxygenSaturation*3
-                  + (stale?9001:0) + static_cast<int>(radioState)*37;
-  if(!g_alarmKeyValid || key!=g_alarmKey){
-    g_alarmKey=key; g_alarmKeyValid=true;
-    drawAlarmStatic(a); drawAlarmTimer(a); drawAlarmHold(hold,g_selfTest);
-    // Evidence for "the trace looks frozen": prints once per repaint, so the interval between
-    // lines is the real reading cadence and hist/timed say whether the trace has a time axis.
-    Serial.printf("[alarm] draw hr=%d spo2=%d seq=%d hist=%d timed=%d age=%lus\n",
-                  reading.effectiveHeartRate,reading.oxygenSaturation,reading.sequence,histCnt,
-                  tracePositional(histEpoch,histCnt)?0:1,
-                  (unsigned long)(reading.lastPacketMs?(millis()-reading.lastPacketMs)/1000:0));
-  }
-
-  static uint32_t lastTimerS=0xFFFFFFFF;
-  const uint32_t showS = g_selfTest ? (uint32_t)a.selfTestLeftS : a.elapsedS;
-  if(showS!=lastTimerS){ lastTimerS=showS; drawAlarmTimer(a); }
-
-  static bool lastFrame=false, lastHoldActive=false; static uint8_t lastPct=255;
-  const bool frameOn=(millis()/ALARM_FLASH_MS)%2==0;
-  if(frameOn!=lastFrame){ lastFrame=frameOn; drawAlarmFrame(frameOn); }
-  if(hold.active!=lastHoldActive || hold.percent!=lastPct){
-    lastHoldActive=hold.active; lastPct=hold.percent; drawAlarmHold(hold,g_selfTest);
-  }
-}
-
-void loop(){
-  static uint32_t lastTouch=0;
-  // Always sampled, even when the alarm owns the screen, so g_touchDown/g_touchX/g_touchY are
-  // fresh for the hold below and the panel is only read once per pass. The gesture result itself
-  // is ignored while the alarm is up - see the view guards on each handler.
-  int tx=0,ty=0; int g = readGesture(tx,ty);
-  const bool alarmOwned = (view==ALARM || g_selfTest);
-
-  // Export mode owns the loop: no BLE, no live view, just serve the page until told to stop.
-  if(view==EXPORT){
-    g_http->handleClient();
-    if(g==3 || millis()-g_exportStart>EXPORT_TIMEOUT_MS) exitExport();   // reboots, never returns
-    static uint32_t lastCd=0;
-    if(millis()-lastCd>1000){ lastCd=millis(); drawExportCountdown(); }
-    delay(5);                                    // keep the server responsive
+  if (g_view == View::EXPORT) {
+    serviceExport(gesture.gesture);
     return;
   }
-  // Swipe up -> share the logged data, but never during an alarm: enterExport() deinitialises
-  // Bluetooth and replaces the screen, which would hide the alarm and stop the readings feeding it.
-  if(g==2 && view==LIVE && firingAlarm()==nullptr){ enterExport(); return; }
-
-  // Hold the HEART cell to run the alarm self-check. This resolves while still touching, unlike
-  // readGesture()'s tap, because the countdown has to be drawn during the hold; holdConsumedTap
-  // then suppresses the release so testing the alarm does not also open the 24-hour chart.
-  // Guarded against g_selfTest: during a self-test the view is still LIVE, and without this both
-  // this block and serviceAlarmView would drive the same HoldState in one pass.
-  bool holdingHeart=false;
-  if(view==LIVE && !g_selfTest){
-    const bool onHeart = g_touchDown && g_touchY>=HDR && g_touchX<COLW;
-    const HoldResult h=holdUpdate(g_hold,onHeart,g_touchX,g_touchY,millis(),HOLD_COUNTDOWN_MS,TAP_MAX_MOVE);
-    if(h.completed){
-      g_selfTest=true; g_selfTestStart=millis(); setBacklight(255);
-      g_alarmKeyValid=false; Serial.println("[alarm] self-test");
-      return;
-    }
-    static bool wasHolding=false;
-    if(h.active){                               // same countdown the alarm screen uses
-      holdingHeart=true;                        // suppress renderLive, or it erases the digit
-      char c[8]; snprintf(c,sizeof(c),"%u",(unsigned)h.secondsLeft);
-      tft.setFont(&fonts::FreeSansBold9pt7b);
-      tft.setTextColor(TFT_YELLOW,BG);          // opaque background so 3->2->1 overwrites cleanly
-      tft.setTextDatum(textdatum_t::middle_center); tft.drawString(c,COLW/2,HDR+RH/2);
-      wasHolding=true;
-    } else if(wasHolding){                      // abandoned: repaint the live view over the digit
-      wasHolding=false; g_renderKeyValid=false;
-    }
-    if(g==1 && holdConsumedTap(g_hold)) g=0;
+  if (g_view == View::MAINTENANCE) {
+    serviceMaintenance(gesture.gesture);
+    return;
   }
 
-  // Gesture ACTIONS are suppressed while the alarm owns the screen - the sample above is still
-  // taken, but a tap must not open the 24-hour chart on top of a running alarm or self-test.
-  if(g==1 && !alarmOwned){
-    lastTouch=millis();
-    if(view==LIVE){
-      if(ty>=HDR){                              // tap a column (number or its sparkline) -> 24h chart
-        plotMetric = (tx<COLW)?0:1; view=PLOT; drawPlot();
-      }
-    } else if(view==PLOT){ // any tap cycles the bin size
-      plotBinMin = (plotBinMin==60)?30:(plotBinMin==30)?15:60; drawPlot();
-    }
+  // Swipe up shares the logged data; swipe down accepts a firmware update. Neither during an alarm
+  // or a self-test: both hand Bluetooth over to WiFi and replace the screen, which would hide the
+  // alarm and stop the readings feeding it.
+  const bool canLeaveLive = g_view == View::LIVE && !g_selfTest && firingAlarm() == nullptr;
+  if (gesture.gesture == Gesture::SWIPE_UP && canLeaveLive) {
+    enterExport();
+    return;
   }
-  // auto-return to the live view after 10 s of no touch in the plot
-  if(view==PLOT && millis()-lastTouch>10000){ view=LIVE; g_renderKeyValid=false; tft.fillScreen(BG); }
-  RadioState radioState = serviceRadioRecovery(millis());
-  ReadingSnapshot reading = readSnapshot();
-
-  // ---- critical alarm ----
-  // Driven every pass, before rendering, so the alarm can take the screen in the same pass it
-  // fires rather than a frame later.
-  const bool stale = reading.lastPacketMs==0 ||
-                     static_cast<uint32_t>(millis()-reading.lastPacketMs)>STALE_MS;
-  {
-    static int lastAlarmSeq=-1;
-    if(reading.sequence!=lastAlarmSeq && reading.lastPacketMs!=0 &&
-       static_cast<uint32_t>(millis()-reading.lastPacketMs)<3000){
-      lastAlarmSeq=reading.sequence;
-      const uint32_t nowE=nowEpochOrZero();      // one clock read per reading, not three
-      if(reading.oxygenSaturation>0) g_spo2StampEpoch=nowE;
-      // The low alarm hears the displayed rate and the high alarm hears the faster decode
-      // whenever the band contradicts itself (highAlarmHeartRate() in band_protocol.h). A
-      // doubled interval must never pose as bradycardia, and a tachycardia whose byte arrives
-      // halved must still be counted even while the screen keeps the byte.
-      const bool highCorrected = reading.highAlarmHeartRate!=reading.heartRate;
-      AlarmEvent ev=alarmOnReading(g_alarm,ALARM_CFG,reading.highAlarmHeartRate,millis(),nowE,
-                                   highCorrected);
-      AlarmEvent evLow=alarmOnReading(g_alarmLow,ALARM_LOW_CFG,reading.effectiveHeartRate,
-                                      millis(),nowE,reading.heartRateCorrected);
-      if(ev.alarmStarted||evLow.alarmStarted) onAlarmStarted(reading);
-      if(ev.episodeResolved)
-        logAlert("RESOLVED",reading.highAlarmHeartRate,reading.oxygenSaturation,"");
-      if(evLow.episodeResolved)
-        logAlert("RESOLVED",reading.effectiveHeartRate,reading.oxygenSaturation,"");
-    }
-    AlarmEvent tick=alarmTick(g_alarm,ALARM_CFG,millis(),stale);
-    AlarmEvent tickLow=alarmTick(g_alarmLow,ALARM_LOW_CFG,millis(),stale);
-    if(tick.alarmStarted||tickLow.alarmStarted) onAlarmStarted(reading);
+  if (gesture.gesture == Gesture::SWIPE_DOWN && canLeaveLive) {
+    enterMaintenance();
+    return;
   }
 
-  if(view==ALARM || g_selfTest){
-    serviceAlarmView(reading,radioState,stale);
-    // Fall through to logging below so the CSV and the trace keep filling behind the alarm.
-  }
-  else if(view==LIVE && !holdingHeart) renderLive(reading,radioState);
+  const HeartHold heartHold = serviceHeartHold(gesture);
+  if (heartHold == HeartHold::COMPLETED) return;
 
-  // day/night backlight, checked every 10 s (no-op unless the level actually changes).
-  // Skipped while the alarm is up: it forces full brightness regardless of the hour, and letting
-  // night mode dim it back down would be the single worst bug this feature could have.
-  static uint32_t lastBl=0;
-  if(view!=ALARM && !g_selfTest && millis()-lastBl>10000){
-    lastBl=millis(); applyBrightness(); applyTheme();
+  const bool alarmOwned = g_view == View::ALARM || g_selfTest;
+  if (gesture.gesture == Gesture::TAP && !alarmOwned) handleTap(gesture.tapX, gesture.tapY);
+  if (g_view == View::PLOT && now - g_lastTouchMs > PLOT_AUTO_RETURN_MS) showLiveView();
+
+  const RadioState radioState = serviceRadioRecovery(now);
+  const ReadingSnapshot reading = readSnapshot();
+  const bool stale = readingIsStale(reading, millis());
+
+  serviceAlarms(reading, stale);
+
+  if (g_view == View::ALARM || g_selfTest) {
+    serviceAlarmView(reading, radioState, stale);   // logging below keeps filling behind the alarm
+  } else if (g_view == View::LIVE && heartHold == HeartHold::NONE) {
+    renderLive(reading, radioState, stale);   // skipped mid-hold, or it would erase the digit
   }
 
-  // log + bin new readings
-  static int lastLogged=-1;
-  if(reading.sequence!=lastLogged && reading.lastPacketMs != 0 &&
-     static_cast<uint32_t>(millis()-reading.lastPacketMs)<3000){
-    lastLogged=reading.sequence;
-    logRow(reading.heartRate,reading.oxygenSaturation,reading.skinC,reading.skinValid,
-           reading.beatMs,reading.effectiveHeartRate);
-    int mod=minuteOfDay();
-    if(mod>=0) addReading(reading.effectiveHeartRate,reading.oxygenSaturation,mod);
-    pushHist(reading.effectiveHeartRate,reading.oxygenSaturation,nowEpochOrZero());  // 1-hour sparklines
-  }
-  delay(g_touching?15:60);                       // sample faster mid-gesture so swipes track well
+  serviceBacklight();
+  recordNewReading(reading);
+  serviceFirmwareHealth();
+
+  delay(g_gesture.touching ? LOOP_DELAY_TOUCHING_MS : LOOP_DELAY_IDLE_MS);
 }

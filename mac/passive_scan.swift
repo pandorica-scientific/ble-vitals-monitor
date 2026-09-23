@@ -1,22 +1,22 @@
-// passive_scan.swift — RECEIVE-ONLY BLE observer for the Baby Sensor Relax system.
+// passive_scan.swift - receive-only BLE survey for the Baby Sensor Relax system on macOS.
 //
-// HARD SAFETY RULE (carried over from owlet-gatt-probe):
-//   - SCAN ONLY. Never connect(), never write, never pair, never subscribe.
-//   - This program cannot break the base<->wristband link because it never transmits
-//     anything to either device; it only listens to advertisements the wristband/base
-//     already broadcast to the whole room.
+// Scan only: never connect, write, pair or subscribe. The program transmits nothing to either
+// device; it listens to advertisements the wristband and base already broadcast to the room.
 //
-// Goal: find the wristband (BS01 / "Oliwia") and base (BG01N) advertisements and see
-// whether their payload bytes change over time — the signature of live vitals.
+// It lists every advertising device seen, flags the wristband (BS01) and base (BG01N) by name, and
+// reports which manufacturer-data payloads change over time, which is the signature of live vitals.
+//
+// Build: swiftc -O mac/passive_scan.swift -o passive_scan
+// Usage: ./passive_scan [seconds]   (default 60)
 
 import Foundation
 import CoreBluetooth
 
 let RUN_SECONDS: Double = Double(CommandLine.arguments.count > 1 ? Int(CommandLine.arguments[1]) ?? 60 : 60)
 
-// Name fragments that likely identify our devices. macOS hides the BLE MAC (gives a
-// synthetic UUID instead), so we match on advertised local name + payload content.
-let NAME_HINTS = ["BS01", "BG01", "BABYSENSOR", "BABY SENSOR", "RELAX", "OLIWIA", "M0L2"]
+// Name fragments that identify the devices. macOS hides the BLE MAC address (it exposes a synthetic
+// UUID instead), so matching is on the advertised local name and payload content.
+let NAME_HINTS = ["BS01", "BG01", "BABYSENSOR", "BABY SENSOR", "RELAX"]
 
 func hex(_ d: Data) -> String { d.map { String(format: "%02X", $0) }.joined() }
 
@@ -49,14 +49,14 @@ final class Observer: NSObject, CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
         switch c.state {
         case .poweredOn:
-            FileHandle.standardError.write("[scan] Bluetooth ON — passive scan for \(Int(RUN_SECONDS))s (RECEIVE-ONLY)\n".data(using: .utf8)!)
-            // allowDuplicates:true => we get every advertisement, so we can watch payloads change.
+            FileHandle.standardError.write("[scan] Bluetooth on; passive scan for \(Int(RUN_SECONDS))s (receive-only)\n".data(using: .utf8)!)
+            // allowDuplicates: every advertisement is delivered, so payload changes can be watched.
             c.scanForPeripherals(withServices: nil,
                                  options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         case .poweredOff:
-            FileHandle.standardError.write("[scan] Bluetooth is OFF — enable it and retry.\n".data(using: .utf8)!)
+            FileHandle.standardError.write("[scan] Bluetooth is off; enable it and retry.\n".data(using: .utf8)!)
         case .unauthorized:
-            FileHandle.standardError.write("[scan] NOT AUTHORIZED — grant Bluetooth permission to the terminal in System Settings > Privacy > Bluetooth.\n".data(using: .utf8)!)
+            FileHandle.standardError.write("[scan] not authorised: grant Bluetooth permission to the terminal in System Settings > Privacy & Security > Bluetooth.\n".data(using: .utf8)!)
         default:
             FileHandle.standardError.write("[scan] state=\(c.state.rawValue)\n".data(using: .utf8)!)
         }
@@ -77,13 +77,13 @@ final class Observer: NSObject, CBCentralManagerDelegate {
             uuids.forEach { s.serviceUUIDs.insert($0.uuidString) }
         }
 
-        // Manufacturer-specific data — most likely place for broadcast vitals.
+        // Manufacturer-specific data: the most likely place for broadcast vitals.
         if let mfg = adv[CBAdvertisementDataManufacturerDataKey] as? Data {
             if let last = s.lastMfg, last != mfg { s.mfgChanges += 1 }
             s.lastMfg = mfg
             if s.mfgSamples.count < 6 && !s.mfgSamples.contains(mfg) { s.mfgSamples.append(mfg) }
         }
-        // Service data — the other common place.
+        // Service data: the other common place.
         if let sd = adv[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data] {
             for (k, v) in sd {
                 let key = k.uuidString
@@ -92,7 +92,7 @@ final class Observer: NSObject, CBCentralManagerDelegate {
             }
         }
 
-        // Flag if the name matches our device hints.
+        // Flag a device whose name matches the hints.
         if let nm = s.name?.uppercased(), NAME_HINTS.contains(where: { nm.contains($0) }) {
             if !s.interesting {
                 s.interesting = true

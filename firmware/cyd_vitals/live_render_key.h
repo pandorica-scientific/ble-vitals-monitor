@@ -5,6 +5,9 @@
 #include "band_protocol.h"
 #include "radio_health.h"
 
+// Everything the live view depends on, reduced to a comparable value. The sketch redraws only when
+// the key changes, and live_render.h compares fields to repaint only the regions that did. Pure logic.
+
 enum AlertMask : uint8_t { ALERT_NONE = 0, ALERT_HR_LOW = 1, ALERT_HR_HIGH = 2, ALERT_SPO2_LOW = 4 };
 
 inline uint8_t makeAlertMask(int heartRate, int oxygen, bool stale,
@@ -20,7 +23,7 @@ inline uint8_t makeAlertMask(int heartRate, int oxygen, bool stale,
 struct LiveRenderKey {
   bool stale = true;
   int sequence = -1;
-  int heartRate = 0;              // raw byte - still shown, in small type, when corrected
+  int heartRate = 0;              // raw byte, still shown in small type when corrected
   int effectiveHeartRate = 0;     // what the big number reads
   int oxygenSaturation = 0;
   int signal = 0;

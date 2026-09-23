@@ -5,6 +5,8 @@ wifi_backup.txt
 **/wifi_backup.txt
 wifi_backup2.txt
 **/wifi_backup2.txt
+ota.txt
+**/ota.txt
 
 # Captured data / logs
 *.csv

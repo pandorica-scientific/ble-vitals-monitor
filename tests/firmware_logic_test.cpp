@@ -9,6 +9,10 @@
 #include "../firmware/cyd_vitals/radio_health.h"
 #include "../firmware/cyd_vitals/wifi_failover.h"
 #include "../firmware/cyd_vitals/day_night.h"
+#include "../firmware/cyd_vitals/history.h"
+#include "../firmware/cyd_vitals/day_bins.h"
+#include "../firmware/cyd_vitals/gesture.h"
+#include "../firmware/cyd_vitals/ota_password.h"
 
 #include <cmath>
 #include <cstdint>
@@ -1004,14 +1008,9 @@ static void testBrightnessRamp() {
   }
 }
 
-// The band's heart-rate byte locks onto every second beat. Across 33 days of logs the rate fell to
-// almost exactly half of the preceding two minutes 70 times, and never once read above 191 - so a
-// true tachycardia arrives halved and invisible, and a real 160 arrives as an 80 that looks like
-// bradycardia. The beat interval settles both, inside a range no human heart leaves.
-// The two decodes fail independently. Eighteen days of six-column logs (64,633 readings,
-// 2026-09-02 to 2026-09-20) hold 757 disagreements of more than 40 bpm: 368 with the interval the
-// higher of the two and 389 with it the lower. Whichever decode is continuous with the last five
-// minutes of agreeing readings is the one to show.
+// Both of the band's decodes lock onto every second beat now and then, independently. Whichever
+// decode is continuous with the last five minutes of agreeing readings is the one to show; the
+// context below is what a disagreement is judged against. See docs/PROTOCOL.md.
 static void testRateContext() {
   RateContext c{};
   int ref = 0;
@@ -1260,6 +1259,172 @@ static void testVitalsCsv() {
   expect(!parseVitalsRow("2026-09-02 15:59", bad), "a truncated line is not a reading");
 }
 
+static void testHistory() {
+  History h{};
+  expect(h.count == 0 && historyNewestEpoch(h) == 0, "an empty history has no newest epoch");
+
+  historyPush(h, 120, 97, 1'000'000);
+  historyPush(h, 125, 98, 1'000'020);
+  historyPush(h, 130, 0, 1'000'040);
+  expect(h.count == 3, "three pushes are three samples");
+  expect(h.heartRate[historyOldest(h, 0)] == 120, "oldest(0) is the first sample");
+  expect(h.heartRate[historyOldest(h, 2)] == 130, "oldest(count-1) is the last sample");
+  expect(h.heartRate[historyNewest(h, 0)] == 130, "newest(0) is the last sample");
+  expect(h.heartRate[historyNewest(h, 2)] == 120, "newest(count-1) is the first sample");
+  expect(historyNewestEpoch(h) == 1'000'040, "the newest epoch is the largest recorded");
+
+  // Values are stored in a byte and clamped rather than wrapped: 300 must not become 44.
+  historyPush(h, 300, -5, 0);
+  expect(h.heartRate[historyNewest(h, 0)] == 254, "a value above the byte range is clamped");
+  expect(h.oxygen[historyNewest(h, 0)] == 0, "a negative value is clamped to zero");
+  expect(tracePositional(h.epoch, h.count), "a sample without a timestamp forces the positional axis");
+
+  // The ring keeps the newest HISTORY_LEN samples, and the two index helpers agree across the wrap.
+  History ring{};
+  for (int i = 0; i < HISTORY_LEN + 10; ++i) historyPush(ring, i % 200, 95, 2'000'000 + i);
+  expect(ring.count == HISTORY_LEN, "the ring is bounded");
+  expect(ring.epoch[historyOldest(ring, 0)] == 2'000'010, "the oldest samples are the ones dropped");
+  expect(ring.epoch[historyNewest(ring, 0)] == 2'000'000 + HISTORY_LEN + 9, "the newest is the last pushed");
+  bool consistent = true;
+  for (int i = 0; i < ring.count; ++i) {
+    if (historyOldest(ring, i) != historyNewest(ring, ring.count - 1 - i)) consistent = false;
+  }
+  expect(consistent, "oldest(i) and newest(count-1-i) name the same slot");
+  expect(historyNewestEpoch(ring) == 2'000'000 + HISTORY_LEN + 9, "newest epoch survives the wrap");
+}
+
+static void testDayBins() {
+  DayBins d{};
+  const BinStats none = dayBinsStats(d, DayMetric::HEART_RATE, 0, DAY_BIN_COUNT);
+  expect(none.count == 0 && none.mean == 0.0f && none.sd == 0.0f, "empty bins have no statistics");
+
+  // Three readings in the 10:00 bin: mean 120, population sd sqrt(200/3).
+  dayBinsAdd(d, 110, 97, 10 * 60 + 1);
+  dayBinsAdd(d, 120, 98, 10 * 60 + 7);
+  dayBinsAdd(d, 130, 99, 10 * 60 + 14);
+  const int tenOclock = (10 * 60) / DAY_BIN_MINUTES;
+  BinStats st = dayBinsStats(d, DayMetric::HEART_RATE, tenOclock, 1);
+  expect(st.count == 3, "three readings land in the 10:00 bin");
+  expect(std::fabs(st.mean - 120.0f) < 0.01f, "the mean is 120");
+  expect(std::fabs(st.sd - std::sqrt(200.0f / 3.0f)) < 0.01f, "the sd is the population sd");
+  BinStats ox = dayBinsStats(d, DayMetric::OXYGEN, tenOclock, 1);
+  expect(ox.count == 3 && std::fabs(ox.mean - 98.0f) < 0.01f, "oxygen is binned alongside");
+
+  // A zero is "no reading" and is not averaged in; a constant series has an sd of exactly zero.
+  dayBinsAdd(d, 0, 0, 10 * 60 + 2);
+  expect(dayBinsStats(d, DayMetric::HEART_RATE, tenOclock, 1).count == 3, "a zero reading is not counted");
+  DayBins flat{};
+  for (int i = 0; i < 40; ++i) dayBinsAdd(flat, 133, 96, 12 * 60);
+  expect(dayBinsStats(flat, DayMetric::HEART_RATE, (12 * 60) / DAY_BIN_MINUTES, 1).sd == 0.0f,
+         "a constant series has zero spread, not a rounding artefact");
+
+  // Grouping: the 10:15 bin joins the 10:00 bin in a one-hour group.
+  dayBinsAdd(d, 200, 90, 10 * 60 + 20);
+  const BinStats hour = dayBinsStats(d, DayMetric::HEART_RATE, tenOclock, 4);
+  expect(hour.count == 4 && std::fabs(hour.mean - 140.0f) < 0.01f, "adjacent bins group into an hour");
+
+  // Out-of-range minutes are ignored rather than written past the array.
+  dayBinsAdd(d, 150, 95, -1);
+  dayBinsAdd(d, 150, 95, 1440);
+  dayBinsAdd(d, 150, 95, 99999);
+  expect(dayBinsStats(d, DayMetric::HEART_RATE, 0, DAY_BIN_COUNT).count == 4, "out-of-range minutes are dropped");
+}
+
+static void testGesture() {
+  const int SWIPE = 130;
+  const int MOVE = 20;
+  const uint32_t TAP_MS = 600;
+
+  // A quick touch that does not move is a tap, reported at its starting point on lift-off.
+  {
+    GestureTracker g{};
+    GestureResult r = gestureUpdate(g, true, 100, 120, 0, SWIPE, MOVE, TAP_MS);
+    expect(r.gesture == Gesture::NONE, "nothing resolves while the finger is down");
+    r = gestureUpdate(g, true, 105, 118, 100, SWIPE, MOVE, TAP_MS);
+    expect(r.gesture == Gesture::NONE, "still nothing while jittering under the finger");
+    r = gestureUpdate(g, false, 0, 0, 200, SWIPE, MOVE, TAP_MS);
+    expect(r.gesture == Gesture::TAP, "lift-off resolves a tap");
+    expect(r.tapX == 100 && r.tapY == 120, "the tap is reported where it began");
+    r = gestureUpdate(g, false, 0, 0, 300, SWIPE, MOVE, TAP_MS);
+    expect(r.gesture == Gesture::NONE, "a gesture is reported once");
+  }
+  // A touch held too long is not a tap: the hold countdown owns that case.
+  {
+    GestureTracker g{};
+    gestureUpdate(g, true, 100, 120, 0, SWIPE, MOVE, TAP_MS);
+    GestureResult r = gestureUpdate(g, false, 0, 0, 600, SWIPE, MOVE, TAP_MS);
+    expect(r.gesture == Gesture::NONE, "a 600 ms press is not a tap");
+  }
+  // A short drag is neither a tap nor a swipe.
+  {
+    GestureTracker g{};
+    gestureUpdate(g, true, 100, 120, 0, SWIPE, MOVE, TAP_MS);
+    gestureUpdate(g, true, 100, 170, 100, SWIPE, MOVE, TAP_MS);
+    GestureResult r = gestureUpdate(g, false, 0, 0, 200, SWIPE, MOVE, TAP_MS);
+    expect(r.gesture == Gesture::NONE, "a 50 px drag is nothing");
+  }
+  // Long, mostly vertical travel is a swipe in the direction of travel, however slow.
+  {
+    GestureTracker g{};
+    gestureUpdate(g, true, 160, 200, 0, SWIPE, MOVE, TAP_MS);
+    gestureUpdate(g, true, 170, 60, 900, SWIPE, MOVE, TAP_MS);
+    expect(gestureUpdate(g, false, 0, 0, 1000, SWIPE, MOVE, TAP_MS).gesture == Gesture::SWIPE_UP,
+           "140 px upward is a swipe up");
+    gestureUpdate(g, true, 160, 40, 2000, SWIPE, MOVE, TAP_MS);
+    gestureUpdate(g, true, 150, 180, 2500, SWIPE, MOVE, TAP_MS);
+    expect(gestureUpdate(g, false, 0, 0, 2600, SWIPE, MOVE, TAP_MS).gesture == Gesture::SWIPE_DOWN,
+           "140 px downward is a swipe down");
+  }
+  // Travel that is more horizontal than vertical is not a swipe, even when it is long.
+  {
+    GestureTracker g{};
+    gestureUpdate(g, true, 20, 40, 0, SWIPE, MOVE, TAP_MS);
+    gestureUpdate(g, true, 300, 180, 300, SWIPE, MOVE, TAP_MS);
+    expect(gestureUpdate(g, false, 0, 0, 400, SWIPE, MOVE, TAP_MS).gesture == Gesture::NONE,
+           "a diagonal that is wider than tall is not a swipe");
+  }
+  // The swipe threshold is inclusive, and the last sample decides the distance.
+  {
+    GestureTracker g{};
+    gestureUpdate(g, true, 100, 200, 0, SWIPE, MOVE, TAP_MS);
+    gestureUpdate(g, true, 100, 20, 100, SWIPE, MOVE, TAP_MS);   // 180 px up ...
+    gestureUpdate(g, true, 100, 70, 200, SWIPE, MOVE, TAP_MS);   // ... then back to 130
+    expect(gestureUpdate(g, false, 0, 0, 300, SWIPE, MOVE, TAP_MS).gesture == Gesture::SWIPE_UP,
+           "exactly the minimum travel counts, measured at lift-off");
+  }
+}
+
+// /ota.txt holds the over-the-air update password: one line, never compiled in. A password that
+// does not fit the buffer is refused rather than silently truncated, because a truncated secret
+// would let a shorter guess through.
+static void testOtaPassword() {
+  char out[OTA_PASSWORD_MAX];
+  expect(parseOtaPassword("correct horse battery\n", out, sizeof(out)) &&
+             std::string(out) == "correct horse battery",
+         "a plain line is the password");
+  expect(parseOtaPassword("  padded-secret \r\n", out, sizeof(out)) &&
+             std::string(out) == "padded-secret",
+         "surrounding whitespace and the carriage return are stripped");
+  expect(parseOtaPassword("\n\nsecond-line-secret\n", out, sizeof(out)) &&
+             std::string(out) == "second-line-secret",
+         "leading blank lines are skipped");
+  expect(parseOtaPassword("first-line-secret\nignored\n", out, sizeof(out)) &&
+             std::string(out) == "first-line-secret",
+         "only the first non-empty line counts");
+  expect(!parseOtaPassword("", out, sizeof(out)), "an empty file is no password");
+  expect(!parseOtaPassword("\r\n \n", out, sizeof(out)), "a file of blank lines is no password");
+  expect(!parseOtaPassword(nullptr, out, sizeof(out)), "a missing file is no password");
+  expect(!parseOtaPassword("short\n", out, sizeof(out)), "fewer than eight characters is refused");
+  expect(parseOtaPassword("12345678", out, sizeof(out)), "eight characters is the minimum");
+  std::string tooLong(OTA_PASSWORD_MAX, 'x');
+  expect(!parseOtaPassword(tooLong.c_str(), out, sizeof(out)),
+         "a password that would not fit is refused, not truncated");
+  std::string longest(OTA_PASSWORD_MAX - 1, 'y');
+  expect(parseOtaPassword(longest.c_str(), out, sizeof(out)) && std::string(out) == longest,
+         "the longest password that fits is accepted whole");
+  expect(!parseOtaPassword("12345678", out, 4), "a buffer too small for the password is refused");
+}
+
 int main() {
   testSolarTimes();
   testUtcOffsetRecovery();
@@ -1284,6 +1449,10 @@ int main() {
   testHoldGesture();
   testAlertLog();
   testContacts();
+  testHistory();
+  testDayBins();
+  testGesture();
+  testOtaPassword();
   if (failures) return EXIT_FAILURE;
   std::puts("firmware logic tests passed");
   return EXIT_SUCCESS;

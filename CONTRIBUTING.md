@@ -95,12 +95,14 @@ technical detail** and it can be discussed privately.
 
 - Keep pull requests focused. One behaviour change per pull request.
 - Firmware logic that can be tested natively should be, in `tests/firmware_logic_test.cpp` —
-  pure headers under `firmware/cyd_vitals/` are the pattern to follow.
-- Run the native tests before opening a pull request:
+  the pure headers under `firmware/cyd_vitals/` are the pattern to follow. Drawing goes in a
+  `*_render.h` header; tunables go in `config.h`. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+- Run the native tests before opening a pull request, and make sure every sketch still compiles:
   ```bash
-  c++ -std=c++17 -Wall -Wextra -Werror tests/firmware_logic_test.cpp -o /tmp/firmware_logic_test
-  /tmp/firmware_logic_test
+  sh tests/run.sh
+  arduino-cli compile -b esp32:esp32:esp32:PartitionScheme=no_fs firmware/cyd_vitals
   ```
+- Formatting follows the repository's `.clang-format` (Google style, 100 columns).
 - Never commit WiFi credentials, phone numbers, or captured CSV data. `.gitignore` covers the
   usual paths, but check `git diff --staged` anyway.
 

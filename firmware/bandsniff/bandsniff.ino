@@ -1,50 +1,62 @@
-// bandsniff.ino — classic ESP32 (BLE 4.2) test: can it receive the Baby Sensor
-// Relax band's advertisements? RECEIVE-ONLY passive test. Never connects/writes.
+// bandsniff.ino - reception test: can this classic ESP32 (BLE 4.2) hear the wristband at all?
 //
-// GO/NO-GO logic:
-//   * If this prints a device named "BS01" or manufacturer data starting F5 03  -> the band
-//     uses LEGACY advertising and the classic ESP32 CAN sniff it.
-//   * If it prints LOTS of other BLE devices but NEVER the band (while the Mac sees it)
-//     -> the band uses BLE 5 EXTENDED advertising; classic ESP32 can't. Need ESP32-C3/C6/S3
-//        or nRF52840.
+// Receive-only. It lists every advertising device it sees and counts the wristband's frames.
 //
-// Build: arduino-cli compile -b esp32:esp32:esp32 esp32_bandsniff
-// Flash: arduino-cli upload  -b esp32:esp32:esp32 -p /dev/cu.usbserial-XXXX esp32_bandsniff
-// View : arduino-cli monitor -p /dev/cu.usbserial-XXXX -c baudrate=115200
+//   Prints ">>> BAND" lines            -> the band uses legacy advertising; this ESP32 can decode it
+//   Prints many other devices, never   -> the band uses BLE 5 extended advertising and this chip
+//   the band (while a phone sees it)      cannot receive it; a BLE 5 receiver is needed
+//
+// Build: arduino-cli compile -b esp32:esp32:esp32 firmware/bandsniff
+// Flash: arduino-cli upload  -b esp32:esp32:esp32 -p /dev/cu.usbserial-XXXX firmware/bandsniff
+// View:  arduino-cli monitor -p /dev/cu.usbserial-XXXX -c baudrate=115200
 
+#include <BLEAdvertisedDevice.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
 
-static uint32_t total = 0, withMfg = 0, bandHits = 0;
+#include "../cyd_vitals/band_protocol.h"
+
+constexpr uint8_t BAND_DEVICE_BASE = 0x04;
+
+static uint32_t g_total = 0;
+static uint32_t g_withManufacturerData = 0;
+static uint32_t g_bandHits = 0;
 
 static String toHex(const String& s) {
-  static const char* h = "0123456789ABCDEF";
+  static const char* digits = "0123456789ABCDEF";
   String out;
-  for (size_t i = 0; i < s.length(); i++) { uint8_t c = (uint8_t)s[i]; out += h[c >> 4]; out += h[c & 0xF]; }
+  for (size_t i = 0; i < s.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(s[i]);
+    out += digits[c >> 4];
+    out += digits[c & 0xF];
+  }
   return out;
 }
 
-class CB : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice dev) override {
-    total++;
-    String name = dev.haveName() ? dev.getName() : String();
-    String mfg  = dev.haveManufacturerData() ? dev.getManufacturerData() : String();
-    bool isBand = name.startsWith("BS01") ||
-                  (mfg.length() >= 2 && (uint8_t)mfg[0] == 0xF5 && (uint8_t)mfg[1] == 0x03);
-    bool isBase = name.startsWith("BG01") ||
-                  (mfg.length() >= 2 && (uint8_t)mfg[0] == 0xF5 && (uint8_t)mfg[1] == 0x04);
-    if (mfg.length()) withMfg++;
+static bool hasPrefix(const String& mfg, uint8_t deviceType) {
+  return mfg.length() >= 2 && static_cast<uint8_t>(mfg[0]) == BAND_FRAME_MARKER &&
+         static_cast<uint8_t>(mfg[1]) == deviceType;
+}
+
+class SniffCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice device) override {
+    ++g_total;
+    const String name = device.haveName() ? device.getName() : String();
+    const String mfg = device.haveManufacturerData() ? device.getManufacturerData() : String();
+    if (mfg.length()) ++g_withManufacturerData;
+
+    const bool isBand = name.startsWith("BS01") || hasPrefix(mfg, BAND_DEVICE_WRISTBAND);
+    const bool isBase = name.startsWith("BG01") || hasPrefix(mfg, BAND_DEVICE_BASE);
     if (isBand) {
-      bandHits++;
-      Serial.printf(">>> BAND! rssi=%d name=%s mfg=%s\n",
-                    dev.getRSSI(), name.c_str(), toHex(mfg).c_str());
+      ++g_bandHits;
+      Serial.printf(">>> BAND  rssi=%d name=%s mfg=%s\n", device.getRSSI(), name.c_str(),
+                    toHex(mfg).c_str());
     } else if (isBase) {
-      Serial.printf("  [base]  rssi=%d name=%s mfg=%s\n",
-                    dev.getRSSI(), name.c_str(), toHex(mfg).c_str());
+      Serial.printf("  [base]  rssi=%d name=%s mfg=%s\n", device.getRSSI(), name.c_str(),
+                    toHex(mfg).c_str());
     } else if (mfg.length()) {
-      Serial.printf("  (other) rssi=%d name=%-16s mfg=%s\n",
-                    dev.getRSSI(), name.length() ? name.c_str() : "-", toHex(mfg).c_str());
+      Serial.printf("  (other) rssi=%d name=%-16s mfg=%s\n", device.getRSSI(),
+                    name.length() ? name.c_str() : "-", toHex(mfg).c_str());
     }
   }
 };
@@ -55,18 +67,20 @@ void setup() {
   Serial.println("\n=== ESP32 band-sniff test (classic BLE 4.2) ===");
   BLEDevice::init("");
   BLEScan* scan = BLEDevice::getScan();
-  scan->setAdvertisedDeviceCallbacks(new CB(), true /*wantDuplicates*/);
-  scan->setActiveScan(true);          // request scan response (gets the name)
+  scan->setAdvertisedDeviceCallbacks(new SniffCallbacks(), true /* report duplicates */);
+  scan->setActiveScan(true);   // requests the scan response, which carries the device name
   scan->setInterval(100);
-  scan->setWindow(99);                // ~99% duty -> best chance to catch the band
-  scan->start(0, nullptr, false);     // continuous
+  scan->setWindow(99);
+  scan->start(0, nullptr, false);
   Serial.println("scanning continuously...");
 }
 
 void loop() {
   delay(5000);
-  Serial.printf("[stat] adverts=%u withMfg=%u  BAND-hits=%u  %s\n",
-                total, withMfg, bandHits,
-                bandHits ? "=> LEGACY adv, ESP32 WORKS" :
-                           "=> no band yet (out of range OR extended adv)");
+  Serial.printf("[stat] adverts=%lu withMfg=%lu band=%lu  %s\n",
+                static_cast<unsigned long>(g_total),
+                static_cast<unsigned long>(g_withManufacturerData),
+                static_cast<unsigned long>(g_bandHits),
+                g_bandHits ? "=> legacy advertising, this ESP32 works"
+                           : "=> no band yet (out of range, or extended advertising)");
 }

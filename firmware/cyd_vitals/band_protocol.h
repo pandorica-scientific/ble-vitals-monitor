@@ -3,21 +3,31 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// The wristband's 23-byte advertisement and the rules for turning it into a heart rate. Pure logic.
+// Every number below is justified in docs/PROTOCOL.md; this file states the rules, not the evidence.
+
+constexpr size_t BAND_FRAME_LEN = 23;
+constexpr uint8_t BAND_FRAME_MARKER = 0xF5;
+constexpr uint8_t BAND_DEVICE_WRISTBAND = 0x03;
+
+// Skin temperature outside this range is treated as no reading. An unworn band in a warm room can
+// still read 28.1 C, so this is a sanity gate, not a wear detector.
 constexpr float BAND_SKIN_MIN_C = 28.0f;
 constexpr float BAND_SKIN_MAX_C = 42.0f;
 
 struct BandReading {
-  uint8_t sequence = 0;
-  uint8_t signal = 0;
-  uint8_t heartRate = 0;
-  uint8_t oxygenSaturation = 0;
-  uint16_t beatMs = 0;
-  float skinC = 0.0f;
+  uint8_t sequence = 0;          // byte 2: measurement counter, +1 per new reading (~20 s)
+  uint8_t signal = 0;            // byte 4: signal-quality hint
+  uint8_t heartRate = 0;         // byte 10: bpm, a windowed average
+  uint8_t oxygenSaturation = 0;  // byte 13: percent
+  uint16_t beatMs = 0;           // bytes 11-12, big-endian: a recent single-beat interval
+  float skinC = 0.0f;            // bytes 6-7, big-endian, tenths of a degree
   bool skinValid = false;
 };
 
 inline bool decodeBandFrame(const uint8_t* bytes, size_t length, BandReading& out) {
-  if (bytes == nullptr || length < 23 || bytes[0] != 0xF5 || bytes[1] != 0x03) return false;
+  if (bytes == nullptr || length < BAND_FRAME_LEN) return false;
+  if (bytes[0] != BAND_FRAME_MARKER || bytes[1] != BAND_DEVICE_WRISTBAND) return false;
   out.sequence = bytes[2];
   out.signal = bytes[4];
   out.heartRate = bytes[10];
@@ -28,18 +38,13 @@ inline bool decodeBandFrame(const uint8_t* bytes, size_t length, BandReading& ou
   return true;
 }
 
-// The band will report a heart rate off bedding. Left facing a mattress in a dark room with no
-// pulse anywhere near it, it produced three measurements of 90, 93 and 96 bpm - values that read
-// as a calmly sleeping baby - while its own beat interval implied 136, 149 and 155. That is the
-// dangerous failure: a band that has come off does not go quiet, it goes reassuring.
+// ---- heart-rate validity ------------------------------------------------------------------------
 //
-// Byte 10 and bytes 11-12 are independent enough to catch it. Worn, they agree: across 182
-// measurements of a sleeping baby the mean disagreement was +0.5 bpm (sd 8.8) and not one reading
-// disagreed by more than 40. Every fabric reading disagreed by 46-59. So 40 bpm separates them
-// with no false positives in the data we have.
-//
-// A disagreement only says that one of the two decodes has lost the beat. Which one is settled
-// below, against the readings that came before. See docs/PROTOCOL.md.
+// The band reports a heart rate off bedding: facing a mattress it produced 90-96 bpm while its own
+// beat interval implied 136-155. Worn, the two decodes agree to within 40 bpm in every genuine
+// reading captured; off the wrist they disagreed by 46-59. So a disagreement above 40 bpm means one
+// of the two decodes has lost the beat. Which one is settled against the recent past, below.
+
 constexpr int BAND_HR_DISAGREE_BPM = 40;
 
 inline bool bandReadingDisagrees(int heartRate, int beatMs) {
@@ -50,30 +55,10 @@ inline bool bandReadingDisagrees(int heartRate, int beatMs) {
   return diff > static_cast<float>(BAND_HR_DISAGREE_BPM);
 }
 
-// Both decodes lock onto every second beat, independently of each other. Across 18 days of the
-// board's own six-column logs (64,633 readings, 2026-09-02 to 2026-09-20) the two disagreed by
-// more than 40 bpm 757 times. 368 times the byte was the one that had halved - typically ~160 on
-// the interval against ~80 on the byte, for 40 s to 9 min, mostly at rates above 150 - and 389
-// times the interval had doubled instead, the byte holding ~130 while the interval implied 60-76
-// for up to 14 min at a stretch. Neither decode is the one to trust. The interval also throws a
-// single wild reading (280, 305 or 365 ms) about every fifteen minutes, in step with the band's
-// SpO2 measurement.
-//
-// What separates the two in every one of those cases is the recent past: the decode that has
-// lost the beat sits at half or double the rate of the last few minutes, and the other one is
-// continuous with it. So when they disagree, the candidate nearer the median of the last five
-// minutes of agreeing readings is shown. Replayed over those 18 days this very code lands within
-// 25 bpm of the surrounding readings in 80% of disagreements, against 22% for always taking the
-// interval and 70% for never correcting. With no context - the first minute after boot, or after
-// a long dropout - the byte stands, being the decode one step closer to the sensor. What defeats
-// it is a long messy stretch where both decodes drop beats in turn, so that the context itself
-// fills with halved readings; 2026-09-19 18:30-19:20 is the example, and the residue of that 20%.
-//
-// The interval is only considered inside a range no human heart leaves. 150 ms is 400 bpm -
-// infant SVT reaches 250-300, so the ceiling has to sit well above it - and 2000 ms is 30 bpm.
-// Outside that the field is garbage and the raw byte is kept, doubtful but at least measured.
-constexpr int BAND_BEAT_MS_MIN = 150;   // 400 bpm
-constexpr int BAND_BEAT_MS_MAX = 2000;  // 30 bpm
+// The interval is only believed inside a range no human heart leaves: 150 ms is 400 bpm (infant SVT
+// reaches 250-300, so the ceiling sits well above it) and 2000 ms is 30 bpm.
+constexpr int BAND_BEAT_MS_MIN = 150;
+constexpr int BAND_BEAT_MS_MAX = 2000;
 
 inline bool bandBeatPlausible(int beatMs) {
   return beatMs >= BAND_BEAT_MS_MIN && beatMs <= BAND_BEAT_MS_MAX;
@@ -85,12 +70,17 @@ inline int intervalHeartRate(int beatMs) {
   return (60000 + beatMs / 2) / beatMs;
 }
 
-// The last few minutes of readings on which the two decodes agreed: what a disagreement is
-// judged against. Sixteen slots cover five minutes at one measurement every ~20 s. The band
-// rebroadcasts each measurement for ~20 s, and mergeBandReading() notes it once.
-constexpr int RATE_CONTEXT_CAP = 16;
-constexpr uint32_t RATE_CONTEXT_MS = 300000;   // five minutes
-constexpr int RATE_CONTEXT_MIN = 3;            // fewer than this is not a trend
+// ---- rate context -------------------------------------------------------------------------------
+//
+// Both decodes lock onto every second beat now and then, independently of each other: over 18 days
+// of logs the byte halved 368 times and the interval doubled 389 times. What separates them in every
+// case is the recent past - the one that lost the beat sits at half or double the rate of the last
+// few minutes. So the last five minutes of readings on which the two agreed are kept, and a
+// disagreement is judged against their median.
+
+constexpr int RATE_CONTEXT_CAP = 16;             // five minutes at one measurement every ~20 s
+constexpr uint32_t RATE_CONTEXT_MS = 300'000;
+constexpr int RATE_CONTEXT_MIN = 3;              // fewer than this is not a trend
 
 struct RateContext {
   int hr[RATE_CONTEXT_CAP] = {};
@@ -115,7 +105,7 @@ inline bool rateContextReference(const RateContext& c, uint32_t nowMs, int& out)
     if (static_cast<uint32_t>(nowMs - c.ms[i]) <= RATE_CONTEXT_MS) recent[n++] = c.hr[i];
   }
   if (n < RATE_CONTEXT_MIN) return false;
-  for (int i = 1; i < n; ++i) {            // insertion sort: n is at most sixteen
+  for (int i = 1; i < n; ++i) {   // insertion sort: n is at most sixteen
     const int v = recent[i];
     int j = i - 1;
     while (j >= 0 && recent[j] > v) {
@@ -128,10 +118,11 @@ inline bool rateContextReference(const RateContext& c, uint32_t nowMs, int& out)
   return true;
 }
 
-// The rate to display, plot, log and feed the low alarm. Equal to the raw byte unless the band
-// contradicts itself with a usable interval AND the interval is the candidate continuous with
-// the recent past. A zero heart rate stays zero: an idle or charging band must never be handed a
-// manufactured rate. A tie goes to the byte.
+// The rate to display, plot, log and feed the slow alarm. Equal to the raw byte unless the band
+// contradicts itself with a usable interval AND the interval is the candidate continuous with the
+// recent past. A zero heart rate stays zero: an idle or charging band is never handed a manufactured
+// rate. With no reference yet, or on a tie, the byte stands as the decode one step closer to the
+// sensor.
 inline int resolveHeartRate(int heartRate, int beatMs, bool haveReference, int reference) {
   if (heartRate <= 0) return heartRate;
   if (!bandBeatPlausible(beatMs)) return heartRate;
@@ -143,13 +134,11 @@ inline int resolveHeartRate(int heartRate, int beatMs, bool haveReference, int r
   return impliedGap < byteGap ? implied : heartRate;
 }
 
-// What the HIGH alarm hears. The one case continuity gets wrong is a tachycardia that begins
-// abruptly - which is how supraventricular tachycardia begins - while the byte halves at the same
-// moment: the halved byte is then the candidate nearer the recent past, and the screen keeps it.
-// So the alarm is handed the faster decode whenever the band contradicts itself, flagged as
-// corrected so the longer confirmation window applies. A single wild interval arms a window that
-// the next ordinary reading abandons. The low alarm hears the displayed rate only: a doubled
-// interval is never allowed to pose as bradycardia.
+// What the fast alarm hears. Continuity has one blind spot: a tachycardia that begins abruptly (as
+// supraventricular tachycardia does) while the byte halves at the same moment - the halved byte is
+// then the candidate nearer the recent past. So the fast alarm is handed the faster decode whenever
+// the band contradicts itself, flagged as corrected so the longer confirmation window applies. The
+// slow alarm hears the displayed rate only: a doubled interval must never pose as bradycardia.
 inline int highAlarmHeartRate(int heartRate, int beatMs, int effectiveHeartRate) {
   if (heartRate <= 0) return effectiveHeartRate;
   if (!bandBeatPlausible(beatMs)) return effectiveHeartRate;
@@ -158,15 +147,17 @@ inline int highAlarmHeartRate(int heartRate, int beatMs, int effectiveHeartRate)
   return implied > effectiveHeartRate ? implied : effectiveHeartRate;
 }
 
+// ---- the published reading ----------------------------------------------------------------------
+
 struct ReadingSnapshot {
   int sequence = -1;
-  int heartRate = 0;            // byte 10, exactly as broadcast - the raw column in the CSV
+  int heartRate = 0;   // byte 10 exactly as broadcast: the raw column in the CSV
   int beatMs = 0;
-  // Derived once per measurement here so the display, the plots, both alarms and the log cannot
-  // disagree about what the rate was. Everything downstream reads these rather than recomputing.
-  int effectiveHeartRate = 0;        // shown, plotted, logged, and heard by the low alarm
+  // Derived once per measurement so the display, the plots, both alarms and the log cannot disagree
+  // about what the rate was.
+  int effectiveHeartRate = 0;        // shown, plotted, logged, and heard by the slow alarm
   bool heartRateCorrected = false;   // effectiveHeartRate came from the beat interval
-  int highAlarmHeartRate = 0;        // heard by the high alarm: the faster decode when they disagree
+  int highAlarmHeartRate = 0;        // heard by the fast alarm: the faster decode when they disagree
   int oxygenSaturation = 0;
   int signal = 0;
   int rssi = 0;
@@ -175,12 +166,12 @@ struct ReadingSnapshot {
   uint32_t lastPacketMs = 0;
 };
 
+// The band rebroadcasts one measurement for ~20 s. The choice between the two decodes is made once,
+// on the first frame of a new sequence, and held: otherwise a context entry expiring mid-sequence
+// could flip the number on screen between two copies of the same reading.
 inline ReadingSnapshot mergeBandReading(const ReadingSnapshot& previous, const BandReading& frame,
                                         int rssi, uint32_t nowMs, RateContext& context) {
   ReadingSnapshot next = previous;
-  // The band rebroadcasts one measurement for ~20 s. The choice between the two decodes is made
-  // once, on the first frame of a new sequence, and held: otherwise a context entry expiring
-  // mid-sequence could flip the number on screen between two copies of the same reading.
   const bool newMeasurement = previous.lastPacketMs == 0 || frame.sequence != previous.sequence;
   next.sequence = frame.sequence;
   next.heartRate = frame.heartRate;
