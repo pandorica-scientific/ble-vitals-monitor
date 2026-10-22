@@ -36,6 +36,7 @@ jobs:
               continue
             fi
             author="$(git log -1 --format='%an <%ae>' "$sha")"
+            case "$author" in *"[bot]"*) echo "skip   $sha  $author (bot)"; continue ;; esac
             if git log -1 --format='%B' "$sha" | grep -qiF "Signed-off-by: $author"; then
               echo "ok     $sha  $author"
             else

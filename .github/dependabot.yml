@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Only GitHub Actions can be updated by Dependabot here: the firmware's Arduino core and libraries
+  # are pinned in .github/workflows/tests.yml and updated by hand.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels: [dependencies]
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
