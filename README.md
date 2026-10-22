@@ -8,6 +8,11 @@ listens to the Bluetooth Low Energy (BLE) advertisements the wristband already b
 the vitals (heart rate, SpO₂, skin temperature), and displays and logs them **without ever
 connecting to the wristband or its base station**, so the official system keeps working untouched.
 
+Status (2026-10-22): v0.1.0 is the first tagged release. The standalone CYD firmware (live view,
+microSD CSV log, 24-hour charts, critical and low heart-rate alarms, phone report) and the Mac tools work;
+CI runs the native tests and compiles every sketch. Nothing is blocked. Code contributions are paused
+while the Contributor Licence Agreement is finalised.
+
 Two ways to use it:
 
 - **Standalone device.** An inexpensive ESP32 "Cheap Yellow Display" (CYD) shows the live vitals,

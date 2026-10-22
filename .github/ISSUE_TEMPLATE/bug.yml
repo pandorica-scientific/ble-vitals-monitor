@@ -1,0 +1,22 @@
+name: Bug
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        This is a hobby project and **not a medical device**. Keep using the official monitor;
+        do not rely on this one for safety.
+  - type: textarea
+    id: what
+    attributes: {label: What happened and what you expected}
+    validations: {required: true}
+  - type: textarea
+    id: repro
+    attributes: {label: Steps to reproduce, description: "Include serial output or a CSV excerpt if you have one.", render: shell}
+  - type: input
+    id: version
+    attributes: {label: Version or commit}
+  - type: input
+    id: hardware
+    attributes: {label: Hardware, description: "CYD board variant, or Mac model for the Swift tools."}
